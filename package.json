@@ -30,6 +30,7 @@
     "web:build": "cd web && bun run build",
     "dev": "tsc --watch",
     "test": "bun test",
+    "test:degradation": "node --test tests/embedding-degradation.node.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
