@@ -16,6 +16,10 @@ import { WebAuth } from "./services/web-auth.js";
 
 import { isConfigured, CONFIG, initConfig } from "./config.js";
 import { log } from "./services/logger.js";
+import {
+  checkEmbeddingGate,
+  degradedEmbeddingError,
+} from "./services/memory-tool-modes.js";
 import type { MemoryType } from "./types/index.js";
 import { getLanguageName } from "./services/language-detector.js";
 import type { MemoryScope } from "./services/client.js";
@@ -642,14 +646,20 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
           }
 
           const mode = args.mode || "help";
-          const needsEmbedding = !["help", "list-shards", "migrate", "export"].includes(mode);
 
-          if (needsEmbedding) {
-            const embeddingInitError = memoryClient.getEmbeddingInitError?.();
-            if (embeddingInitError) {
-              return JSON.stringify({ success: false, error: embeddingInitError });
-            }
+          // Modes that only read/write the database must keep working when the
+          // embedding model is unavailable (native DLL conflict, offline first
+          // run). Only add/search/import need vectors; they report a clear
+          // degraded error instead of failing silently.
+          const gate = checkEmbeddingGate(mode, memoryClient.getEmbeddingInitError?.());
+          if (gate.blocked) {
+            return JSON.stringify({
+              success: false,
+              embeddingsDegraded: true,
+              error: gate.error,
+            });
           }
+          const needsEmbedding = gate.needsEmbedding;
 
           try {
             if (needsEmbedding) {
@@ -659,6 +669,13 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
             }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            if (needsEmbedding) {
+              return JSON.stringify({
+                success: false,
+                embeddingsDegraded: true,
+                error: degradedEmbeddingError(message),
+              });
+            }
             return JSON.stringify({
               success: false,
               error: `Memory system failed to initialize: ${message}`,
