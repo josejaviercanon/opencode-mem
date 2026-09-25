@@ -25,6 +25,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && bunx tsc && bun run web:build",
+    "build:local": "node scripts/rebuild-local.mjs",
     "web:dev": "cd web && bun run dev",
     "web:build": "cd web && bun run build",
     "dev": "tsc --watch",
