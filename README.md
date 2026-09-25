@@ -1,5 +1,12 @@
 # OpenCode Memory
 
+> **Platform support: Windows 11 x64 only.**
+> This fork is developed, packaged and verified on Windows 11 x64 with all four
+> companion plugins (`opencode-elf`, `opencode-mem`, `openrtk`, `caveman`)
+> enabled in the same OpenCode process. Linux and macOS are not supported.
+> Co-install requires the pinned native dependency versions documented in
+> [Native dependencies and co-install](#native-dependencies-and-co-install).
+
 [![npm version](https://img.shields.io/npm/v/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
 [![npm downloads](https://img.shields.io/npm/dm/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
 [![license](https://img.shields.io/npm/l/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
@@ -34,6 +41,26 @@ This plugin uses embedded Turso/libSQL with native vector indexes (`F32_BLOB`, `
 - For source/development installs, run `bun install` before building or testing. The published plugin package installs its runtime dependencies automatically through OpenCode.
 
 **CI-tested platforms:** Linux, Windows, macOS 15 and macOS 26 on both Intel (`darwin/x64`) and Apple Silicon (`darwin/arm64`). Older macOS releases are not excluded by that matrix; they are simply outside the current GitHub-hosted runner set.
+
+### Native dependencies and co-install
+
+Windows resolves native DLLs by **base name** and reuses the first module already loaded in the process. When `opencode-mem` and `opencode-elf` run in the same OpenCode process, both must ship the **same** native dependency versions or the second plugin fails to load its bindings:
+
+| Native dependency | Required version | Failure when mismatched |
+| --- | --- | --- |
+| `onnxruntime-node` | 1.20.1 | `LoadLibrary failed: The operating system cannot run %1.` (ERROR_INVALID_ORDINAL, 182) |
+| `sharp` (libvips-42.dll) | 0.35.4 | `LoadLibrary failed: The specified procedure could not be found.` (ERROR_PROC_NOT_FOUND, 127) |
+
+`opencode-mem` pins both directly and via `overrides` in `package.json`. Do not lower these pins when installing from source or when another plugin shares the process. A system-wide `onnxruntime.dll` in `C:\Windows\System32` (installed by Windows ML) can also be picked up by the loader and cause the same failures.
+
+### Graceful degradation when embeddings are unavailable
+
+When the embedding model cannot load, database-only modes keep working instead of the `memory` tool failing as a whole:
+
+- Working: `help`, `list`, `profile`, `forget`, `list-shards`, `migrate`, `export`
+- Degraded (returns `embeddingsDegraded: true`): `add`, `search`, `import` — these need vectors
+
+**Troubleshooting `LoadLibrary failed: The operating system cannot run %1.` on Windows:** this is a native DLL base-name conflict with another loaded plugin (or the System32 Windows ML copy), not a broken package install. Reinstalling `onnxruntime-node` does not fix it. Align the versions in the table above (upgrade the other plugin or remove its older DLL) and restart OpenCode.
 
 **Notes:**
 
