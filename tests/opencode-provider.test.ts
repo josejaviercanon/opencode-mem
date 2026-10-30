@@ -1,21 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { z } from "zod";
 import {
+  clearConnectedProvidersRefresher,
   createV2Client,
+  ensureProviderConnected,
   generateStructuredOutput,
   getV2Client,
   isInternalStructuredSession,
   isProviderConnected,
+  noteStructuredOutputStep,
   resetHostFetch,
   resetInternalStructuredSessions,
   setConnectedProviders,
+  setConnectedProvidersRefresher,
   setHostFetch,
+  setStructuredOutputTimeoutConfig,
   setStructuredOutputTimeoutMsForTests,
   setV2Client,
+  shouldUseOpencodeTextJson,
   STRUCTURED_OUTPUT_AGENT,
+  STRUCTURED_OUTPUT_DEFAULT_RETRY_COUNT,
+  STRUCTURED_OUTPUT_MAX_STEPS,
   STRUCTURED_OUTPUT_METADATA,
   STRUCTURED_OUTPUT_PERMISSIONS,
   STRUCTURED_OUTPUT_TOOLS,
+  takeStructuredOutputStepAbortError,
+  rememberSessionModel,
+  clearRememberedSessionModelForTests,
+  resolveOpencodeModelRef,
 } from "../src/services/ai/opencode-provider.js";
 
 const schema = z.object({
@@ -72,6 +84,7 @@ function installFetchMock(responder: (call: FetchCall) => { status?: number; bod
 describe("connected providers state", () => {
   afterEach(() => {
     setConnectedProviders([]);
+    setConnectedProvidersRefresher(undefined);
   });
 
   it("setConnectedProviders + isProviderConnected reflect known providers", () => {
@@ -86,6 +99,45 @@ describe("connected providers state", () => {
     setConnectedProviders(["openai"]);
     expect(isProviderConnected("anthropic")).toBe(false);
     expect(isProviderConnected("openai")).toBe(true);
+  });
+
+  it("ensureProviderConnected refreshes once on miss and skips on hit", async () => {
+    let refreshCalls = 0;
+    setConnectedProviders(["opencode"]);
+    setConnectedProvidersRefresher(async () => {
+      refreshCalls += 1;
+      setConnectedProviders(["opencode", "newapi"]);
+    });
+
+    expect(await ensureProviderConnected("opencode")).toBe(true);
+    expect(refreshCalls).toBe(0);
+
+    expect(await ensureProviderConnected("newapi")).toBe(true);
+    expect(refreshCalls).toBe(1);
+    expect(await ensureProviderConnected("ghost")).toBe(false);
+    expect(refreshCalls).toBe(2);
+  });
+
+  it("clearConnectedProvidersRefresher only clears matching identity", async () => {
+    let calls = 0;
+    const refresher = async () => {
+      calls += 1;
+      setConnectedProviders(["opencode", "newapi"]);
+    };
+    const other = async () => {
+      calls += 10;
+    };
+    setConnectedProviders(["opencode"]);
+    setConnectedProvidersRefresher(refresher);
+
+    clearConnectedProvidersRefresher(other);
+    expect(await ensureProviderConnected("newapi")).toBe(true);
+    expect(calls).toBe(1);
+
+    clearConnectedProvidersRefresher(refresher);
+    setConnectedProviders(["opencode"]);
+    expect(await ensureProviderConnected("newapi")).toBe(false);
+    expect(calls).toBe(1);
   });
 });
 
@@ -103,6 +155,44 @@ describe("v2 client cache", () => {
     expect(typeof client.session.prompt).toBe("function");
     expect(typeof client.session.delete).toBe("function");
   });
+
+  it("setV2Client enables SDK structured output without createV2Client", async () => {
+    const mod = await import(`../src/services/ai/opencode-provider.js?cachebust=${Math.random()}`);
+    const calls: string[] = [];
+    const client = {
+      session: {
+        create: async () => {
+          calls.push("create");
+          return { data: { id: "ses_sdk_native" } };
+        },
+        prompt: async () => {
+          calls.push("prompt");
+          return {
+            data: {
+              info: { structured_output: { topic: "native-v2", count: 1 } },
+              parts: [],
+            },
+          };
+        },
+        delete: async () => {
+          calls.push("delete");
+        },
+      },
+    };
+
+    mod.setV2Client(client);
+    const result = await mod.generateStructuredOutput({
+      client,
+      providerID: "github-copilot",
+      modelID: "gpt-4o-mini",
+      systemPrompt: "s",
+      userPrompt: "u",
+      schema,
+    });
+
+    expect(result).toEqual({ topic: "native-v2", count: 1 });
+    expect(calls).toEqual(["create", "prompt", "delete"]);
+  });
 });
 
 describe("generateStructuredOutput", () => {
@@ -112,6 +202,7 @@ describe("generateStructuredOutput", () => {
     mock = undefined;
     resetHostFetch();
     resetInternalStructuredSessions();
+    setStructuredOutputTimeoutConfig(90_000);
     setStructuredOutputTimeoutMsForTests(undefined);
   });
 
@@ -119,6 +210,7 @@ describe("generateStructuredOutput", () => {
     mock?.restore();
     resetHostFetch();
     resetInternalStructuredSessions();
+    setStructuredOutputTimeoutConfig(90_000);
     setStructuredOutputTimeoutMsForTests(undefined);
   });
 
@@ -173,11 +265,172 @@ describe("generateStructuredOutput", () => {
     const format = promptBody.format as Record<string, unknown>;
     expect(format.type).toBe("json_schema");
     expect(format.schema).toBeDefined();
+    expect(format.retryCount).toBe(STRUCTURED_OUTPUT_DEFAULT_RETRY_COUNT);
 
     const deleteCall = mock.calls.find((c) => c.method === "DELETE");
     expect(deleteCall).toBeDefined();
     expect(deleteCall!.url.endsWith("/session/ses_test_1")).toBe(true);
     expect(isInternalStructuredSession("ses_test_1")).toBe(false);
+  });
+
+  it("uses text-JSON (no format:json_schema) for anthropic / claude-auth (#278)", async () => {
+    mock = installFetchMock((call) => {
+      if (call.method === "POST" && call.url.endsWith("/session")) {
+        return { body: { id: "ses_anthropic_text" } };
+      }
+      if (call.method === "POST" && call.url.includes("/session/ses_anthropic_text/message")) {
+        return {
+          body: {
+            info: {},
+            parts: [
+              {
+                type: "text",
+                text: '```json\n{"topic":"claude-auth","count":2}\n```',
+              },
+            ],
+          },
+        };
+      }
+      if (call.method === "DELETE") {
+        return { body: true };
+      }
+      throw new Error(`unexpected fetch: ${call.method} ${call.url}`);
+    });
+
+    const client = createV2Client("http://127.0.0.1:9999");
+    const result = await generateStructuredOutput({
+      client,
+      providerID: "anthropic",
+      modelID: "claude-haiku-4-5-20251001",
+      systemPrompt: "system",
+      userPrompt: "user",
+      schema,
+    });
+
+    expect(result).toEqual({ topic: "claude-auth", count: 2 });
+    expect(shouldUseOpencodeTextJson("anthropic")).toBe(true);
+    expect(shouldUseOpencodeTextJson("github-copilot")).toBe(false);
+
+    const promptCall = mock.calls.find((c) =>
+      c.url.includes("/session/ses_anthropic_text/message")
+    );
+    expect(promptCall).toBeDefined();
+    const promptBody = promptCall!.body as Record<string, unknown>;
+    expect(promptBody.format).toBeUndefined();
+    expect(promptBody.tools).toEqual({ "*": false });
+    expect(promptBody.noReply).toBe(false);
+    expect(String(promptBody.system)).toContain("JSON Schema");
+  });
+
+  it("forwards variant inside format:json_schema path", async () => {
+    mock = installFetchMock((call) => {
+      if (call.method === "POST" && call.url.endsWith("/session")) {
+        return { body: { id: "ses_variant_1" } };
+      }
+      if (call.method === "POST" && call.url.includes("/session/ses_variant_1/message")) {
+        return {
+          body: {
+            info: { structured_output: { topic: "auth", count: 3 } },
+            parts: [],
+          },
+        };
+      }
+      if (call.method === "DELETE" && call.url.endsWith("/session/ses_variant_1")) {
+        return { body: true };
+      }
+      throw new Error(`unexpected fetch: ${call.method} ${call.url}`);
+    });
+
+    const client = createV2Client("http://127.0.0.1:9999");
+    await generateStructuredOutput({
+      client,
+      providerID: "newapi",
+      modelID: "grok-4.7",
+      variant: "xhigh",
+      systemPrompt: "system",
+      userPrompt: "user",
+      schema,
+    });
+
+    const promptCall = mock.calls.find((c) => c.url.includes("/session/ses_variant_1/message"));
+    const promptBody = promptCall!.body as Record<string, unknown>;
+    // V1 SDK SessionPromptData.body: model has no variant; a sibling
+    // top-level `variant` field carries it.
+    expect(promptBody.model).toEqual({ providerID: "newapi", modelID: "grok-4.7" });
+    expect(promptBody.variant).toBe("xhigh");
+  });
+
+  it("omits the variant key when not provided (json_schema and text-json paths)", async () => {
+    mock = installFetchMock((call) => {
+      if (call.method === "POST" && call.url.endsWith("/session")) {
+        return { body: { id: "ses_novariant" } };
+      }
+      if (call.method === "POST" && call.url.includes("/session/ses_novariant/message")) {
+        return {
+          body: {
+            info: { structured_output: { topic: "auth", count: 3 } },
+            parts: [],
+          },
+        };
+      }
+      if (call.method === "DELETE" && call.url.endsWith("/session/ses_novariant")) {
+        return { body: true };
+      }
+      throw new Error(`unexpected fetch: ${call.method} ${call.url}`);
+    });
+
+    const client = createV2Client("http://127.0.0.1:9999");
+    await generateStructuredOutput({
+      client,
+      providerID: "newapi",
+      modelID: "grok-4.7",
+      systemPrompt: "system",
+      userPrompt: "user",
+      schema,
+    });
+
+    const promptCall = mock.calls.find((c) => c.url.includes("/session/ses_novariant/message"));
+    const promptBody = promptCall!.body as Record<string, unknown>;
+    expect(promptBody).not.toHaveProperty("variant");
+    expect(promptBody.model).toEqual({ providerID: "newapi", modelID: "grok-4.7" });
+  });
+
+  it("forwards variant on the anthropic text-json path as a top-level body field", async () => {
+    mock = installFetchMock((call) => {
+      if (call.method === "POST" && call.url.endsWith("/session")) {
+        return { body: { id: "ses_anthropic_variant" } };
+      }
+      if (call.method === "POST" && call.url.includes("/session/ses_anthropic_variant/message")) {
+        return {
+          body: {
+            info: {},
+            parts: [{ type: "text", text: '{"topic":"auth","count":3}' }],
+          },
+        };
+      }
+      if (call.method === "DELETE" && call.url.endsWith("/session/ses_anthropic_variant")) {
+        return { body: true };
+      }
+      throw new Error(`unexpected fetch: ${call.method} ${call.url}`);
+    });
+
+    const client = createV2Client("http://127.0.0.1:9999");
+    await generateStructuredOutput({
+      client,
+      providerID: "anthropic",
+      modelID: "claude-haiku-4-5",
+      variant: "high",
+      systemPrompt: "system",
+      userPrompt: "user",
+      schema,
+    });
+
+    const promptCall = mock.calls.find((c) =>
+      c.url.includes("/session/ses_anthropic_variant/message")
+    );
+    const promptBody = promptCall!.body as Record<string, unknown>;
+    expect(promptBody.model).toEqual({ providerID: "anthropic", modelID: "claude-haiku-4-5" });
+    expect(promptBody.variant).toBe("high");
   });
 
   it("rejects with full info.error details when opencode reports an assistant error", async () => {
@@ -804,9 +1057,11 @@ describe("resolveOpencodeModelRef / inherit", () => {
     const { join } = await import("node:path");
     tempRoot = mkdtempSync(join(tmpdir(), "opencode-mem-inherit-"));
     process.env.XDG_STATE_HOME = tempRoot;
+    clearRememberedSessionModelForTests();
   });
 
   afterEach(async () => {
+    clearRememberedSessionModelForTests();
     if (originalStateHome === undefined) {
       delete process.env.XDG_STATE_HOME;
     } else {
@@ -819,16 +1074,15 @@ describe("resolveOpencodeModelRef / inherit", () => {
     }
   });
 
-  it("passes concrete model ids through unchanged", async () => {
-    const { resolveOpencodeModelRef } = await import("../src/services/ai/opencode-provider.js");
+  it("passes concrete model ids through unchanged", () => {
     expect(resolveOpencodeModelRef({ providerID: "local", modelID: "h100/qwen:latest" })).toEqual({
       providerID: "local",
       modelID: "h100/qwen:latest",
     });
   });
 
-  it("prefers the recorded prompt model when modelID is inherit", async () => {
-    const { resolveOpencodeModelRef } = await import("../src/services/ai/opencode-provider.js");
+  it("prefers the recorded prompt model when modelID is inherit", () => {
+    rememberSessionModel("opencode-go", "should-not-win");
     expect(
       resolveOpencodeModelRef({
         providerID: "local",
@@ -839,6 +1093,32 @@ describe("resolveOpencodeModelRef / inherit", () => {
       providerID: "anthropic",
       modelID: "claude-haiku-4-5-20251001",
     });
+  });
+
+  it("uses the remembered host session model before model.json", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const stateDir = join(tempRoot!, "opencode");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, "model.json"),
+      JSON.stringify({
+        recent: [{ providerID: "local", modelID: "from-model-json" }],
+      })
+    );
+    rememberSessionModel("opencode-go", "host-session-model");
+    expect(resolveOpencodeModelRef({ providerID: "local", modelID: "inherit" })).toEqual({
+      providerID: "opencode-go",
+      modelID: "host-session-model",
+    });
+  });
+
+  it("ignores blank or literal inherit values when remembering the session model", () => {
+    rememberSessionModel("opencode-go", "inherit");
+    rememberSessionModel("", "ignored");
+    expect(() => resolveOpencodeModelRef({ providerID: "local", modelID: "inherit" })).toThrow(
+      /no session model was recorded and no recent OpenCode model is available/
+    );
   });
 
   it("falls back to OpenCode recent model.json when inherit has no prompt model", async () => {
@@ -856,15 +1136,13 @@ describe("resolveOpencodeModelRef / inherit", () => {
       })
     );
 
-    const { resolveOpencodeModelRef } = await import("../src/services/ai/opencode-provider.js");
     expect(resolveOpencodeModelRef({ providerID: "local", modelID: "inherit" })).toEqual({
       providerID: "local",
       modelID: "h100/qwen:latest",
     });
   });
 
-  it("throws a clear error when inherit has no prompt model and no recent list", async () => {
-    const { resolveOpencodeModelRef } = await import("../src/services/ai/opencode-provider.js");
+  it("throws a clear error when inherit has no prompt model and no recent list", () => {
     expect(() => resolveOpencodeModelRef({ providerID: "local", modelID: "inherit" })).toThrow(
       /no session model was recorded and no recent OpenCode model is available/
     );
@@ -935,6 +1213,7 @@ describe("generateStructuredOutput tool isolation (issue #189)", () => {
     mock = undefined;
     resetHostFetch();
     resetInternalStructuredSessions();
+    setStructuredOutputTimeoutConfig(90_000);
     setStructuredOutputTimeoutMsForTests(undefined);
   });
 
@@ -942,6 +1221,7 @@ describe("generateStructuredOutput tool isolation (issue #189)", () => {
     mock?.restore();
     resetHostFetch();
     resetInternalStructuredSessions();
+    setStructuredOutputTimeoutConfig(90_000);
     setStructuredOutputTimeoutMsForTests(undefined);
   });
 
@@ -1049,6 +1329,215 @@ describe("generateStructuredOutput tool isolation (issue #189)", () => {
     expect(calls.some((c) => c.method === "POST" && c.url.includes("/abort"))).toBe(true);
     expect(calls.some((c) => c.method === "DELETE")).toBe(true);
     expect(isInternalStructuredSession("ses_hang")).toBe(false);
+  });
+
+  it("uses the configured timeout (setStructuredOutputTimeoutConfig) with no test override", async () => {
+    // No setStructuredOutputTimeoutMsForTests call: the value injected by the
+    // plugin init (CONFIG.opencodeTimeoutMs) must drive the inner timeout.
+    const { setStructuredOutputTimeoutConfig } =
+      await import("../src/services/ai/opencode-provider.js");
+    setStructuredOutputTimeoutConfig(40);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req =
+        input instanceof Request
+          ? input
+          : new Request(typeof input === "string" ? input : input.toString(), init);
+      const url = req.url;
+      const method = req.method.toUpperCase();
+      if (method === "POST" && url.endsWith("/session")) {
+        return new Response(JSON.stringify({ id: "ses_config_timeout" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (method === "POST" && url.includes("/session/ses_config_timeout/message")) {
+        return await new Promise<Response>(() => {});
+      }
+      if (method === "POST" && url.includes("/abort")) {
+        return new Response(JSON.stringify(true), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (method === "DELETE") {
+        return new Response(JSON.stringify(true), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    }) as typeof fetch;
+    mock = {
+      calls: [],
+      restore: () => {
+        globalThis.fetch = originalFetch;
+      },
+    };
+
+    try {
+      const client = createV2Client("http://127.0.0.1:9999");
+      await expect(
+        generateStructuredOutput({
+          client,
+          providerID: "github-copilot",
+          modelID: "gpt-4o-mini",
+          systemPrompt: "s",
+          userPrompt: "u",
+          schema,
+        })
+      ).rejects.toThrow(/structured-output timed out after 40ms/);
+    } finally {
+      setStructuredOutputTimeoutConfig(90_000);
+    }
+  });
+
+  it("includes actionable provider-loop guidance in the timeout error", async () => {
+    setStructuredOutputTimeoutMsForTests(20);
+
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req =
+        input instanceof Request
+          ? input
+          : new Request(typeof input === "string" ? input : input.toString(), init);
+      const url = req.url;
+      const method = req.method.toUpperCase();
+      if (method === "POST" && url.endsWith("/session")) {
+        return new Response(JSON.stringify({ id: "ses_timeout_msg" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (method === "POST" && url.includes("/session/ses_timeout_msg/message")) {
+        return await new Promise<Response>(() => {});
+      }
+      if (method === "POST" && url.includes("/abort")) {
+        return new Response(JSON.stringify(true), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (method === "DELETE") {
+        return new Response(JSON.stringify(true), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    }) as typeof fetch;
+    mock = {
+      calls: [],
+      restore: () => {
+        globalThis.fetch = original;
+      },
+    };
+
+    const client = createV2Client("http://127.0.0.1:9999");
+    await expect(
+      generateStructuredOutput({
+        client,
+        providerID: "anthropic",
+        modelID: "claude-haiku-4-5-20251001",
+        systemPrompt: "s",
+        userPrompt: "u",
+        schema,
+      })
+    ).rejects.toThrow(/memoryModel \+ memoryApiUrl fallback/);
+  });
+
+  it("noteStructuredOutputStep aborts after STRUCTURED_OUTPUT_MAX_STEPS on a live session (#278)", async () => {
+    setStructuredOutputTimeoutMsForTests(5_000);
+
+    let releasePrompt!: (value: Response) => void;
+    const promptGate = new Promise<Response>((resolve) => {
+      releasePrompt = resolve;
+    });
+
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req =
+        input instanceof Request
+          ? input
+          : new Request(typeof input === "string" ? input : input.toString(), init);
+      const url = req.url;
+      const method = req.method.toUpperCase();
+      if (method === "POST" && url.endsWith("/session")) {
+        return new Response(JSON.stringify({ id: "ses_steps" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (method === "POST" && url.includes("/session/ses_steps/message")) {
+        return await promptGate;
+      }
+      if (method === "POST" && url.includes("/abort")) {
+        return new Response(JSON.stringify(true), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (method === "DELETE") {
+        return new Response(JSON.stringify(true), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    }) as typeof fetch;
+    mock = {
+      calls: [],
+      restore: () => {
+        globalThis.fetch = original;
+      },
+    };
+
+    const client = createV2Client("http://127.0.0.1:9999");
+    const pending = generateStructuredOutput({
+      client,
+      providerID: "anthropic",
+      modelID: "claude-haiku-4-5-20251001",
+      systemPrompt: "s",
+      userPrompt: "u",
+      schema,
+    });
+
+    // Wait until the internal session is marked.
+    for (let i = 0; i < 50 && !isInternalStructuredSession("ses_steps"); i++) {
+      await Bun.sleep(10);
+    }
+    expect(isInternalStructuredSession("ses_steps")).toBe(true);
+
+    expect(noteStructuredOutputStep("ses_steps")).toEqual({
+      tracked: true,
+      steps: 1,
+      shouldAbort: false,
+    });
+    expect(noteStructuredOutputStep("ses_steps")).toEqual({
+      tracked: true,
+      steps: 2,
+      shouldAbort: false,
+    });
+    expect(noteStructuredOutputStep("ses_steps")).toEqual({
+      tracked: true,
+      steps: 3,
+      shouldAbort: true,
+    });
+    expect(STRUCTURED_OUTPUT_MAX_STEPS).toBe(2);
+
+    releasePrompt(
+      new Response(
+        JSON.stringify({
+          info: { error: { name: "AbortError", data: { message: "Aborted" } } },
+          parts: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    await expect(pending).rejects.toThrow(/aborted after 3 steps/);
+    expect(takeStructuredOutputStepAbortError("ses_steps")).toBeUndefined();
   });
 
   it("tracks internal session IDs only while the prompt is in flight", async () => {

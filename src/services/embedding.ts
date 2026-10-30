@@ -1,5 +1,6 @@
 import { CONFIG } from "../config.js";
 import { log } from "./logger.js";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   formatOnnxruntimeInitError,
@@ -12,6 +13,100 @@ const requireFromHere = createRuntimeRequire(import.meta);
 const TIMEOUT_MS = 30000;
 const GLOBAL_EMBEDDING_KEY = Symbol.for("opencode-mem.embedding.instance");
 const MAX_CACHE_SIZE = 100;
+/**
+ * Per-attempt ceiling for one remote embedding HTTP call. Kept at 8s so
+ * 3 attempts + linear backoff stay under the outer embedWithTimeout budget
+ * (TIMEOUT_MS = 30s). A single hung request costs one attempt instead of the
+ * whole budget (#400: one transient hang previously aborted an entire import
+ * with zero memories written).
+ */
+const REMOTE_ATTEMPT_TIMEOUT_MS = 8000;
+/** Attempts per remote embedding call: 1 try + 2 retries on transient failures. */
+const REMOTE_MAX_ATTEMPTS = 3;
+/** Base backoff between remote embedding attempts; scales linearly (backoffMs * attempt). */
+const REMOTE_RETRY_BACKOFF_MS = 500;
+
+// ONNX weight variants in descending precision, mirroring transformers.js
+// DEFAULT_DTYPE_SUFFIX_MAPPING (utils/dtypes.js). fp32 has no filename suffix.
+const ONNX_DTYPE_VARIANTS = [
+  ["fp32", ""],
+  ["fp16", "_fp16"],
+  ["q8", "_quantized"],
+  ["int8", "_int8"],
+  ["uint8", "_uint8"],
+  ["q4", "_q4"],
+  ["q4f16", "_q4f16"],
+  ["bnb4", "_bnb4"],
+  ["q2", "_q2"],
+  ["q2f16", "_q2f16"],
+  ["q1", "_q1"],
+  ["q1f16", "_q1f16"],
+] as const;
+
+/** Concrete dtype strings accepted by transformers.js `pipeline({ dtype })`. */
+export type LocalOnnxDtype = (typeof ONNX_DTYPE_VARIANTS)[number][0] | "auto";
+
+type DeclaredDtype =
+  { kind: "string"; value: LocalOnnxDtype } | { kind: "object" } | { kind: "absent" };
+
+function modelCacheRoot(model: string, cacheRoot?: string): string {
+  return join(cacheRoot ?? join(CONFIG.storagePath, ".cache"), model);
+}
+
+/**
+ * Read `transformers.js_config.dtype` from the cached config.json.
+ * String declarations outrank the cache probe. Object (per-file) maps must not
+ * be overridden — transformers.js resolves them after loading config. Absent or
+ * malformed configs fall through to the cache probe.
+ */
+function readDeclaredDtype(model: string, cacheRoot?: string): DeclaredDtype {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(join(modelCacheRoot(model, cacheRoot), "config.json"), "utf-8")
+    );
+    const declared = parsed?.["transformers.js_config"]?.dtype;
+    if (typeof declared === "string" && declared.trim()) {
+      return { kind: "string", value: declared.trim() as LocalOnnxDtype };
+    }
+    if (declared && typeof declared === "object" && !Array.isArray(declared)) {
+      return { kind: "object" };
+    }
+    return { kind: "absent" };
+  } catch {
+    return { kind: "absent" };
+  }
+}
+
+/**
+ * Resolve the dtype whose ONNX weights are already cached, so a quantized-only
+ * repo is not asked for `model.onnx` (fp32). Returns undefined when nothing is
+ * cached yet — transformers.js then falls back to its own defaults.
+ */
+function detectCachedDtype(model: string, cacheRoot?: string): LocalOnnxDtype | undefined {
+  const onnxDir = join(modelCacheRoot(model, cacheRoot), "onnx");
+  const hit = ONNX_DTYPE_VARIANTS.find(([, suffix]) =>
+    existsSync(join(onnxDir, `model${suffix}.onnx`))
+  );
+  return hit?.[0];
+}
+
+/**
+ * Resolve a concrete dtype to pass into transformers.js `pipeline()`, or
+ * undefined to leave dtype selection to transformers.js defaults / config.
+ *
+ * @param model Hugging Face model id (cache subdirectory under `.cache`)
+ * @param cacheRoot Optional override for `{storagePath}/.cache` (tests)
+ */
+export function resolveLocalOnnxDtype(
+  model: string,
+  cacheRoot?: string
+): LocalOnnxDtype | undefined {
+  const declared = readDeclaredDtype(model, cacheRoot);
+  if (declared.kind === "string") return declared.value;
+  // Per-file object maps: do not pass options.dtype — it would override config.
+  if (declared.kind === "object") return undefined;
+  return detectCachedDtype(model, cacheRoot);
+}
 
 export type EmbeddingTask = "document" | "query";
 
@@ -19,24 +114,77 @@ export type EmbedOptions = {
   task?: EmbeddingTask;
 };
 
-const TASK_PREFIXES: Record<EmbeddingTask, string> = {
+const NOMIC_TASK_PREFIXES: Record<EmbeddingTask, string> = {
   document: "search_document: ",
   query: "search_query: ",
 };
 
+export type EmbeddingTaskPrefixOptions = {
+  useTaskPrefixes?: boolean;
+  queryPrefix?: string;
+  documentPrefix?: string;
+};
+
 /**
- * Apply Nomic-style task prefixes when enabled.
+ * Resolve the prefix for a task: explicit/custom → Nomic (when enabled) → none.
+ * Empty string means "no prefix" (disables Nomic fallback for that task).
+ */
+export function resolveEmbeddingTaskPrefix(
+  task: EmbeddingTask,
+  options: EmbeddingTaskPrefixOptions = {}
+): string {
+  const custom = task === "query" ? options.queryPrefix : options.documentPrefix;
+  if (custom !== undefined) return custom;
+  if (options.useTaskPrefixes) return NOMIC_TASK_PREFIXES[task];
+  return "";
+}
+
+/**
+ * Apply task prefixes when configured.
  * Cache keys and API/local inputs should use the returned string.
+ *
+ * Third argument accepts the legacy boolean (`useTaskPrefixes`) or an options
+ * object. Defaults read from CONFIG (custom/preset prefixes + Nomic flag).
  */
 export function applyEmbeddingTaskPrefix(
   text: string,
   options?: EmbedOptions,
-  useTaskPrefixes: boolean = CONFIG.embeddingUseTaskPrefixes
+  useTaskPrefixesOrOpts: boolean | EmbeddingTaskPrefixOptions = {
+    useTaskPrefixes: CONFIG.embeddingUseTaskPrefixes,
+    queryPrefix: CONFIG.embeddingQueryPrefix,
+    documentPrefix: CONFIG.embeddingDocumentPrefix,
+  }
 ): string {
-  if (!useTaskPrefixes || !options?.task) return text;
-  const prefix = TASK_PREFIXES[options.task];
+  if (!options?.task) return text;
+
+  const prefixOpts: EmbeddingTaskPrefixOptions =
+    typeof useTaskPrefixesOrOpts === "boolean"
+      ? {
+          useTaskPrefixes: useTaskPrefixesOrOpts,
+          queryPrefix: CONFIG.embeddingQueryPrefix,
+          documentPrefix: CONFIG.embeddingDocumentPrefix,
+        }
+      : {
+          useTaskPrefixes: useTaskPrefixesOrOpts.useTaskPrefixes ?? CONFIG.embeddingUseTaskPrefixes,
+          queryPrefix: useTaskPrefixesOrOpts.queryPrefix ?? CONFIG.embeddingQueryPrefix,
+          documentPrefix: useTaskPrefixesOrOpts.documentPrefix ?? CONFIG.embeddingDocumentPrefix,
+        };
+
+  const prefix = resolveEmbeddingTaskPrefix(options.task, prefixOpts);
+  if (!prefix) return text;
   if (text.startsWith(prefix)) return text;
   return `${prefix}${text}`;
+}
+
+function embeddingCacheFingerprint(): string {
+  return [
+    CONFIG.embeddingModel,
+    CONFIG.embeddingPooling,
+    CONFIG.embeddingQueryPrefix ?? "",
+    CONFIG.embeddingDocumentPrefix ?? "",
+    CONFIG.embeddingUseTaskPrefixes ? "1" : "0",
+    CONFIG.embeddingDtype ?? "",
+  ].join("\0");
 }
 
 type HfTransformers = typeof import("@huggingface/transformers");
@@ -55,7 +203,7 @@ function getTransformersPackageSpecifier(): string {
 
 async function ensureTransformersLoaded(): Promise<NonNullable<typeof _transformers>> {
   if (_transformers !== null) return _transformers;
-  // Pin onnxruntime-node (+ common) to our direct 1.20.1 stack before transformers
+  // Pin onnxruntime-node (+ common) to our direct 1.30.0 stack before transformers
   // resolves them (#184 / #210 / #225). Load the CJS export so Module._resolveFilename
   // shim applies — the ESM entry's static import bypasses it under OpenCode nested installs.
   //
@@ -107,6 +255,97 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+/** Remote embedding call failed with an HTTP status. */
+export class EmbeddingHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    statusText: string
+  ) {
+    super(`API embedding failed: ${status} ${statusText}`);
+    this.name = "EmbeddingHttpError";
+  }
+}
+
+/**
+ * Classify an embedding fetch failure as retryable. Only transient conditions
+ * are retried: HTTP 429/5xx, per-attempt AbortSignal timeouts, and network
+ * TypeErrors from fetch. JSON parse errors, other 4xx, and unexpected errors
+ * fail fast so programming/shape bugs are not amplified across attempts.
+ */
+function isRetryableEmbeddingError(error: unknown): boolean {
+  if (error instanceof EmbeddingHttpError) {
+    return error.status === 429 || error.status >= 500;
+  }
+  if (error instanceof DOMException) {
+    return error.name === "TimeoutError" || error.name === "AbortError";
+  }
+  // fetch network failures surface as TypeError; AbortSignal.timeout may too
+  // depending on runtime (Bun/Node) — accept TimeoutError/AbortError names.
+  if (error instanceof Error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") return true;
+    if (error instanceof TypeError) return true;
+  }
+  return false;
+}
+
+/**
+ * Perform a remote embedding request with bounded retries. Each attempt uses
+ * AbortSignal.timeout so a hung connection is cancelled (not orphaned via
+ * Promise.race); transient failures (network, abort/timeout, 429, 5xx) are
+ * retried with linear backoff, everything else fails fast.
+ *
+ * `fetchImpl` is injectable for tests.
+ */
+export async function fetchRemoteEmbeddingWithRetry(
+  fetchImpl: typeof fetch,
+  input: string,
+  options: {
+    url?: string;
+    apiKey?: string;
+    model?: string;
+    attemptTimeoutMs?: number;
+    maxAttempts?: number;
+    backoffMs?: number;
+  } = {}
+): Promise<any> {
+  const url = options.url ?? CONFIG.embeddingApiUrl;
+  const apiKey = options.apiKey ?? CONFIG.embeddingApiKey;
+  const model = options.model ?? CONFIG.embeddingModel;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? REMOTE_ATTEMPT_TIMEOUT_MS;
+  const maxAttempts = options.maxAttempts ?? REMOTE_MAX_ATTEMPTS;
+  const backoffMs = options.backoffMs ?? REMOTE_RETRY_BACKOFF_MS;
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetchImpl(`${url}/embeddings`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ input, model }),
+        signal: AbortSignal.timeout(attemptTimeoutMs),
+      });
+      if (!response.ok) {
+        throw new EmbeddingHttpError(response.status, response.statusText);
+      }
+      try {
+        return await response.json();
+      } catch (parseError) {
+        throw new Error("Invalid embedding API JSON", { cause: parseError });
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts || !isRetryableEmbeddingError(error)) {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 export class EmbeddingService {
   private pipe: any = null;
   private initPromise: Promise<void> | null = null;
@@ -114,7 +353,7 @@ export class EmbeddingService {
   /** Set when warmup fails permanently; prevents "initializing forever" (#184). */
   public initError: string | null = null;
   private cache: Map<string, Float32Array> = new Map();
-  private cachedModelName: string | null = null;
+  private cachedFingerprint: string | null = null;
 
   static getInstance(): EmbeddingService {
     if (!(globalThis as any)[GLOBAL_EMBEDDING_KEY]) {
@@ -134,29 +373,11 @@ export class EmbeddingService {
   private async initializeModel(progressCallback?: (progress: any) => void): Promise<void> {
     try {
       if (CONFIG.embeddingApiUrl && CONFIG.embeddingApiKey) {
-        // Send a probe request to verify the API endpoint is actually reachable
-        // Uses a minimal embedding of "ping" to test the full request pipeline
-        const probeResponse = await withTimeout(
-          fetch(`${CONFIG.embeddingApiUrl}/embeddings`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${CONFIG.embeddingApiKey}`,
-            },
-            body: JSON.stringify({
-              input: "ping",
-              model: CONFIG.embeddingModel,
-            }),
-          }),
-          TIMEOUT_MS
-        );
-
-        if (!probeResponse.ok) {
-          throw new Error(
-            `Embedding API health check failed: ${probeResponse.status} ${probeResponse.statusText}`
-          );
-        }
-
+        // Send a probe request to verify the API endpoint is actually reachable.
+        // Uses a minimal embedding of "ping" to test the full request pipeline.
+        // Retried on transient failure (#400): a single hung probe previously
+        // burned the whole 30s budget and set the sticky initError.
+        await fetchRemoteEmbeddingWithRetry(fetch, "ping");
         this.isWarmedUp = true;
         this.initError = null;
         return;
@@ -164,12 +385,26 @@ export class EmbeddingService {
 
       // Local model path
       const { pipeline } = await ensureTransformersLoaded();
+      // Explicit config wins; otherwise auto-resolve from model declaration / cache (#393).
+      const dtype = CONFIG.embeddingDtype ?? resolveLocalOnnxDtype(CONFIG.embeddingModel);
+      if (dtype) {
+        log("Resolved local ONNX dtype for embedding warmup", {
+          model: CONFIG.embeddingModel,
+          dtype,
+          source: CONFIG.embeddingDtype ? "config" : "auto",
+        });
+      }
       this.pipe = await pipeline("feature-extraction", CONFIG.embeddingModel, {
+        ...(dtype ? { dtype } : {}),
         progress_callback: progressCallback,
       });
       this.isWarmedUp = true;
       this.initError = null;
-      log("Embedding model warmed up", { model: CONFIG.embeddingModel });
+      log("Embedding model warmed up", {
+        model: CONFIG.embeddingModel,
+        pooling: CONFIG.embeddingPooling,
+        dtype: dtype ?? null,
+      });
     } catch (error) {
       const rewritten = formatOnnxruntimeInitError(error);
       this.initPromise = null;
@@ -180,9 +415,10 @@ export class EmbeddingService {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<Float32Array> {
-    if (this.cachedModelName !== CONFIG.embeddingModel) {
+    const fingerprint = embeddingCacheFingerprint();
+    if (this.cachedFingerprint !== fingerprint) {
       this.clearCache();
-      this.cachedModelName = CONFIG.embeddingModel;
+      this.cachedFingerprint = fingerprint;
     }
 
     const input = applyEmbeddingTaskPrefix(text, options);
@@ -200,26 +436,13 @@ export class EmbeddingService {
     let result: Float32Array;
 
     if (CONFIG.embeddingApiUrl && CONFIG.embeddingApiKey) {
-      const response = await fetch(`${CONFIG.embeddingApiUrl}/embeddings`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${CONFIG.embeddingApiKey}`,
-        },
-        body: JSON.stringify({
-          input,
-          model: CONFIG.embeddingModel,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`API embedding failed: ${response.statusText}`);
-      }
-
-      const data: any = await response.json();
+      const data: any = await fetchRemoteEmbeddingWithRetry(fetch, input);
       result = new Float32Array(data.data[0].embedding);
     } else {
-      const output = await this.pipe(input, { pooling: "mean", normalize: true });
+      const output = await this.pipe(input, {
+        pooling: CONFIG.embeddingPooling,
+        normalize: true,
+      });
       result = new Float32Array(output.data);
     }
 

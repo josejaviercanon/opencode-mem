@@ -1,10 +1,45 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const tempDirs: string[] = [];
+const projectRoot = fileURLToPath(new URL("../", import.meta.url));
+const bundleCache = new Map<string, string>();
+
+function buildBundle(entrypoint: string): string {
+  const cached = bundleCache.get(entrypoint);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  // Isolate from the test-runner resolver cache (oven-sh/bun#22941) via a fresh
+  // Bun process. Prefer --outfile over stdout (stdout is the status line then).
+  const dir = mkdtempSync(join(tmpdir(), "opencode-mem-bundle-"));
+  tempDirs.push(dir);
+  const outfile = join(dir, "bundle.js");
+  const result = Bun.spawnSync({
+    cmd: [
+      process.execPath,
+      "build",
+      entrypoint,
+      "--target=bun",
+      "--packages=bundle",
+      `--outfile=${outfile}`,
+    ],
+    cwd: projectRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stderr = Buffer.from(result.stderr).toString("utf8");
+  expect(result.exitCode, stderr).toBe(0);
+
+  const output = readFileSync(outfile, "utf8");
+  expect(output.length).toBeGreaterThan(0);
+  bundleCache.set(entrypoint, output);
+  return output;
+}
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
@@ -13,15 +48,8 @@ afterEach(() => {
 });
 
 describe("OpenCode plugin loader bundle boundary", () => {
-  it("does not pull local embedding transformer internals into the plugin-loader bundle", async () => {
-    const result = await Bun.build({
-      entrypoints: ["./dist/plugin.js"],
-      target: "bun",
-      packages: "bundle",
-    });
-
-    expect(result.success).toBe(true);
-    const output = await result.outputs[0]!.text();
+  it("does not pull local embedding transformer internals into the plugin-loader bundle", () => {
+    const output = buildBundle("./dist/plugin.js");
     expect(output).not.toContain("node_modules/@huggingface/transformers");
     expect(output).not.toContain("@huggingface/transformers/src");
     expect(output).not.toContain("@huggingface/transformers/dist");
@@ -29,15 +57,8 @@ describe("OpenCode plugin loader bundle boundary", () => {
     expect(output).not.toContain("node_modules/@xenova/transformers");
   }, 30_000);
 
-  it("does not pull opencode SDK or OIDC internals into the plugin-loader bundle", async () => {
-    const result = await Bun.build({
-      entrypoints: ["./dist/plugin.js"],
-      target: "bun",
-      packages: "bundle",
-    });
-
-    expect(result.success).toBe(true);
-    const output = await result.outputs[0]!.text();
+  it("does not pull opencode SDK or OIDC internals into the plugin-loader bundle", () => {
+    const output = buildBundle("./dist/plugin.js");
     expect(output).not.toContain("@opencode-ai/sdk/v2/client");
     expect(output).not.toContain("node_modules/@opencode-ai/sdk");
     expect(output).not.toContain("@vercel/oidc");
@@ -45,14 +66,7 @@ describe("OpenCode plugin loader bundle boundary", () => {
   }, 30_000);
 
   it("resolves the provider module from a single-file bundled lazy loader", async () => {
-    const result = await Bun.build({
-      entrypoints: ["./dist/services/ai/opencode-provider-loader.js"],
-      target: "bun",
-      packages: "bundle",
-    });
-
-    expect(result.success).toBe(true);
-    const output = await result.outputs[0]!.text();
+    const output = buildBundle("./dist/services/ai/opencode-provider-loader.js");
     expect(output).not.toContain("@opencode-ai/sdk/v2/client");
     expect(output).not.toContain("@vercel/oidc");
 

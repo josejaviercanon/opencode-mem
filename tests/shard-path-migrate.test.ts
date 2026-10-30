@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -260,6 +261,129 @@ describe("shard path migration", () => {
     expect(oldShards).toHaveLength(1);
     expect(existsSync(oldShards[0]!.dbPath)).toBe(true);
   });
+
+  migrationTest(
+    "aborts ownership loss during staging with originals and registry unchanged",
+    async () => {
+      const getProjectTagInfo = await createProjects();
+      const { tag, hash } = await seedShard(oldProjectDir, [
+        { id: "one", content: "first" },
+        { id: "two", content: "second", shardIndex: 1 },
+      ]);
+      const { CONFIG } = await import("../src/config.js");
+      const { tursoShardManager } = await import("../src/services/turso/shard-manager.js");
+      const { tursoConnectionManager } =
+        await import("../src/services/turso/connection-manager.js");
+      const { tursoVectorSearch } = await import("../src/services/turso/vector-search.js");
+      const originals = await tursoShardManager.getAllShards("project", hash);
+      const update = tursoVectorSearch.updateProjectAssociation;
+      const lockPath = join(CONFIG.storagePath, ".turso-operation.lock");
+      let staged = 0;
+      tursoVectorSearch.updateProjectAssociation = async function (...args) {
+        const result = await update.apply(this, args);
+        staged++;
+        writeFileSync(lockPath, JSON.stringify({ pid: 2147483647 }));
+        return result;
+      };
+      try {
+        const { shardPathMigrationService } =
+          await import("../src/services/shard-path-migration-service.js");
+        const result = await shardPathMigrationService.migrate({
+          currentDirectory: newProjectDir,
+          fromHash: hash,
+          allowLinkedSource: true,
+        });
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("ownership lost");
+      } finally {
+        tursoVectorSearch.updateProjectAssociation = update;
+      }
+      expect(staged).toBe(1);
+      expect(await tursoShardManager.getAllShards("project", hash)).toEqual(originals);
+      const newHash = getProjectTagInfo(newProjectDir).tag.split("_").pop()!;
+      expect(await tursoShardManager.getAllShards("project", newHash)).toHaveLength(0);
+      for (const shard of originals) {
+        const rows = await tursoVectorSearch.getAllMemories(
+          await tursoConnectionManager.getConnection(shard.dbPath)
+        );
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.container_tag).toBe(tag.tag);
+        expect(rows[0]?.project_path).toBe(oldProjectDir);
+      }
+      expect(existsSync(join(CONFIG.storagePath, ".path-migrate-swap.json"))).toBe(false);
+      expect(JSON.parse(readFileSync(lockPath, "utf-8")).pid).toBe(2147483647);
+    }
+  );
+
+  for (const journalRemains of [false, true]) {
+    migrationTest(
+      `preserves swaps and successor memories on ownership loss (journal remains: ${journalRemains})`,
+      async () => {
+        const getProjectTagInfo = await createProjects();
+        const { hash } = await seedShard(oldProjectDir, [{ id: "original", content: "keep me" }]);
+        const { CONFIG } = await import("../src/config.js");
+        const { tursoShardManager } = await import("../src/services/turso/shard-manager.js");
+        const { tursoConnectionManager } =
+          await import("../src/services/turso/connection-manager.js");
+        const { tursoVectorSearch } = await import("../src/services/turso/vector-search.js");
+        const originalShard = (await tursoShardManager.getAllShards("project", hash))[0]!;
+        const reassign = tursoShardManager.reassignShardScope;
+        const target = getProjectTagInfo(newProjectDir);
+        const targetHash = target.tag.split("_").pop()!;
+        let successorPath = "";
+        tursoShardManager.reassignShardScope = async function (...args) {
+          await reassign.apply(this, args);
+          successorPath = args[2];
+          writeFileSync(
+            join(CONFIG.storagePath, ".turso-operation.lock"),
+            JSON.stringify({
+              id: "successor",
+              pid: process.pid,
+              timestamp: new Date().toISOString(),
+            })
+          );
+          const db = await tursoConnectionManager.getConnection(successorPath);
+          await tursoVectorSearch.insertVector(db, {
+            id: "successor-memory",
+            content: "written after takeover",
+            vector: new Float32Array([1, 0]),
+            containerTag: target.tag,
+            type: "project",
+            createdAt: 123,
+            updatedAt: 123,
+          });
+          if (journalRemains) {
+            const { heartbeatTursoLock } = await import("../src/services/turso/operation-lock.js");
+            heartbeatTursoLock(join(CONFIG.storagePath, ".turso-operation.lock"), "former-owner");
+          }
+        };
+        try {
+          const { shardPathMigrationService } =
+            await import("../src/services/shard-path-migration-service.js");
+          const result = await shardPathMigrationService.migrate({
+            currentDirectory: newProjectDir,
+            fromHash: hash,
+            allowLinkedSource: true,
+          });
+          expect(result.success).toBe(false);
+          expect(result.error).toMatch(/interrupted.*may have completed.*recoverable/);
+          expect(existsSync(join(CONFIG.storagePath, ".path-migrate-swap.json"))).toBe(
+            journalRemains
+          );
+          expect(existsSync(originalShard.dbPath)).toBe(false);
+          expect(await tursoShardManager.getAllShards("project", hash)).toHaveLength(0);
+          expect((await tursoShardManager.getAllShards("project", targetHash))[0]?.dbPath).toBe(
+            successorPath
+          );
+          const db = await tursoConnectionManager.getConnection(successorPath);
+          expect(await tursoVectorSearch.getMemoryById(db, "original")).toBeTruthy();
+          expect(await tursoVectorSearch.getMemoryById(db, "successor-memory")).toBeTruthy();
+        } finally {
+          tursoShardManager.reassignShardScope = reassign;
+        }
+      }
+    );
+  }
 
   migrationTest("refuses to migrate a still-linked source unless explicitly allowed", async () => {
     await createProjects();

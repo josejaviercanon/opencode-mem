@@ -8,6 +8,7 @@ import { userProfileManager } from "./user-profile/user-profile-manager.js";
 import { sortProfileItems } from "../utils/profile.js";
 import type { UserProfile, UserProfileData } from "./user-profile/types.js";
 import { loadOpencodeProvider } from "./ai/opencode-provider-loader.js";
+import { tryAcquireProfileLearningLock } from "./user-profile/learning-lock.js";
 
 let isLearningRunning = false;
 
@@ -66,8 +67,24 @@ export async function performUserProfileLearning(
     });
     return;
   }
+
+  // Set before the first await so a same-process re-entry bounces off the flag
+  // instead of queueing behind this run and running a second analysis.
+  //
+  // `isLearningRunning` only guards re-entry inside one process. Prompt selection
+  // is a plain SELECT and the batch is marked only after the LLM responds, so
+  // without cross-process exclusion two instances sharing this storage would
+  // analyze the same prompts and the slower writer would clobber the faster
+  // one's profile update. Contention skips this round; the next idle retries.
   isLearningRunning = true;
+  let releaseLearningLock: (() => Promise<void> | void) | null = null;
   try {
+    releaseLearningLock = await tryAcquireProfileLearningLock(directory);
+    if (!releaseLearningLock) {
+      log("user-profile-learning: skipped (another process holds the learning lock)");
+      return;
+    }
+
     const count = await userPromptManager.countUnanalyzedForUserLearning();
     const threshold = CONFIG.userProfileAnalysisInterval;
 
@@ -168,8 +185,9 @@ Rules:
     }
 
     const context = buildUserAnalysisContext(prompts, existingProfile, validationPrompt);
+    const langName = await resolveProfileLanguageName(prompts);
 
-    const analysisResult = await analyzeUserProfile(context, existingProfile);
+    const analysisResult = await analyzeUserProfile(context, existingProfile, langName);
 
     log("user-profile-learning: analyze done", { hasResult: !!analysisResult });
 
@@ -290,7 +308,17 @@ Rules:
     log("user-profile-learning: aborted", { error: String(error) });
     throw error;
   } finally {
-    isLearningRunning = false;
+    // Release only when the lock was actually acquired (contention return,
+    // acquisition failure, and any throw before acquisition all leave it null).
+    // The flag resets in a nested finally so it stays raised while the release
+    // await is in flight — otherwise a same-process re-entry could slip in and
+    // find the cross-process lock already gone — and it still resets when the
+    // release itself rejects.
+    try {
+      await releaseLearningLock?.();
+    } finally {
+      isLearningRunning = false;
+    }
   }
 }
 
@@ -640,14 +668,89 @@ async function applyValidations(
   return `validated: ${confirmed} confirmed, ${contradicted} contradicted, ${inaccurate} inaccurate, ${oversimplified} oversimplified`;
 }
 
+/**
+ * Resolves the language the profile-analysis LLM must write in, honoring the
+ * same `autoCaptureLanguage` config used by auto-capture (src/services/auto-capture.ts)
+ * so auto-captured memories and the user profile follow the same language setting.
+ *
+ * In "auto" mode, detection runs on the raw prompt text only — never on the
+ * analysis context, whose English instruction scaffold would bias detection
+ * toward English for short non-English prompts.
+ */
+export async function resolveProfileLanguageName(prompts: UserPrompt[]): Promise<string> {
+  const { detectLanguage, getLanguageName } = await import("./language-detector.js");
+  const targetLang =
+    CONFIG.autoCaptureLanguage === "auto" || !CONFIG.autoCaptureLanguage
+      ? detectLanguage(prompts.map((p) => p.content).join("\n\n"))
+      : CONFIG.autoCaptureLanguage;
+  return getLanguageName(targetLang);
+}
+
+/**
+ * Outer safety-net timeout wrapping one structured-output call: the configured
+ * timeout plus a fixed margin, so the inner, more informative provider
+ * timeout always fires first. Local (not imported from config.ts) because
+ * subprocess test scenarios mock the config module with a minimal export
+ * surface.
+ */
+function outerStructuredTimeoutMs(configured: number | undefined): number {
+  return (configured ?? 90_000) + 30_000;
+}
+
+/**
+ * System prompt for the profile analysis.
+ *
+ * `mode` selects the transport the same analysis is served through:
+ * - "tool": the external-API tool-call path (`update_user_profile` forced
+ *   tool). The prompt must instruct the model to use that tool.
+ * - "json": the OpenCode structured-output path (v2 Generate API exposes no
+ *   tools). A tool instruction here makes obedient models stall on a
+ *   preamble ("Let me load the profile update tool first.") and return no
+ *   JSON, so the model is told to answer with the profile JSON object itself.
+ */
+function buildProfileSystemPrompt(
+  existingProfile: UserProfile | null,
+  langName: string,
+  mode: "tool" | "json"
+): string {
+  const closing =
+    mode === "tool"
+      ? `Use the update_user_profile tool to save the ${existingProfile ? "updated" : "new"} profile.`
+      : `Return the ${existingProfile ? "updated" : "new"} profile as the JSON object described in the request. Reply with JSON only.`;
+  return `You are a user behavior analyst for a coding assistant.
+
+Your task is to analyze user prompts and ${existingProfile ? "update" : "create"} a comprehensive user profile.
+
+CRITICAL: You MUST write all descriptions, categories, and text in ${langName}.
+
+CRITICAL: All JSON string values MUST escape double quotes with backslash. Do NOT use unescaped quotation marks inside string values.
+
+${closing}`;
+}
+
 async function analyzeUserProfile(
   context: string,
-  existingProfile: UserProfile | null
+  existingProfile: UserProfile | null,
+  langName: string
 ): Promise<AnalysisResult | null> {
-  log("user-profile-learning: analyze called", { hasProfile: !!existingProfile });
+  // Outer safety net for the structured-output call. Derived from the same
+  // configured timeout the inner (informative) structured-output timeout uses,
+  // plus a margin, so the inner one always fires first and the error message
+  // names the real cause instead of a generic race timeout.
+  const outerTimeoutMs = outerStructuredTimeoutMs(CONFIG.opencodeTimeoutMs);
   let opencodeProviderError: unknown;
   if (CONFIG.opencodeProvider && CONFIG.opencodeModel) {
+    const systemPrompt = buildProfileSystemPrompt(existingProfile, langName, "json");
+    log("user-profile-learning: analyze called", { hasProfile: !!existingProfile });
     log("user-profile-learning: trying opencode provider");
+    // The try/catch boundary is the provider only: LLM client construction,
+    // the structured-output call, and schema binding. Stored-profile parsing
+    // and merging happen AFTER a successful LLM response and outside this
+    // try — a cold-storage read/parse/merge failure must propagate to the
+    // caller (logged + rethrown there), never be mistaken for a provider
+    // fault that silently falls back to the external API and then
+    // re-reads/re-merges the same broken storage.
+    let rawData: UserProfileData | null = null;
     try {
       const { generateStructuredOutput } = await loadOpencodeProvider();
       const { getOpenCodeClient } = await import("./ai/profile-llm-client.js");
@@ -655,19 +758,10 @@ async function analyzeUserProfile(
       log("user-profile-learning: opencode provider diag", {
         provider: CONFIG.opencodeProvider,
         model: CONFIG.opencodeModel,
+        ...(CONFIG.opencodeVariant ? { variant: CONFIG.opencodeVariant } : {}),
       });
 
       const v2Client = await getOpenCodeClient();
-
-      const systemPrompt = `You are a user behavior analyst for a coding assistant.
-
-Your task is to analyze user prompts and ${existingProfile ? "update" : "create"} a comprehensive user profile.
-
-CRITICAL: Detect the language used by the user in their prompts. You MUST output all descriptions, categories, and text in the SAME language as the user's prompts.
-
-CRITICAL: All JSON string values MUST escape double quotes with backslash. Do NOT use unescaped quotation marks inside string values.
-
-Use the update_user_profile tool to save the ${existingProfile ? "updated" : "new"} profile.`;
 
       const { z } = await import("zod");
       const schema = createUserProfileAnalysisSchema(z);
@@ -679,12 +773,13 @@ Use the update_user_profile tool to save the ${existingProfile ? "updated" : "ne
           client: v2Client,
           providerID: CONFIG.opencodeProvider,
           modelID: CONFIG.opencodeModel,
+          ...(CONFIG.opencodeVariant ? { variant: CONFIG.opencodeVariant } : {}),
           systemPrompt,
           userPrompt: context,
           schema,
         }),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("user-profile-learning: timeout")), 120000)
+          setTimeout(() => reject(new Error("user-profile-learning: timeout")), outerTimeoutMs)
         ),
       ]);
 
@@ -694,8 +789,18 @@ Use the update_user_profile tool to save the ${existingProfile ? "updated" : "ne
         wfCount: result.workflows?.length,
       });
 
-      const rawData = result as unknown as UserProfileData;
+      rawData = result as unknown as UserProfileData;
+    } catch (e) {
+      opencodeProviderError = e;
+      log("user-profile-learning: opencode provider failed, falling back to external API", {
+        error: String(e),
+      });
+    }
 
+    // Stored-profile parse/merge runs only after a native success and is
+    // deliberately OUTSIDE the provider catch: storage faults here are not
+    // provider faults and must not trigger the external fallback.
+    if (rawData !== null) {
       if (existingProfile) {
         const existingData: UserProfileData = JSON.parse(existingProfile.profileData);
         const merged = await userProfileManager.mergeProfileData(
@@ -707,11 +812,6 @@ Use the update_user_profile tool to save the ${existingProfile ? "updated" : "ne
         return { raw: rawData, merged };
       }
       return { raw: rawData, merged: null };
-    } catch (e) {
-      opencodeProviderError = e;
-      log("user-profile-learning: opencode provider failed, falling back to external API", {
-        error: String(e),
-      });
     }
   }
 
@@ -733,20 +833,10 @@ Use the update_user_profile tool to save the ${existingProfile ? "updated" : "ne
 
   const provider = AIProviderFactory.createProvider(CONFIG.memoryProvider, providerConfig);
 
-  const systemPrompt = `You are a user behavior analyst for a coding assistant.
-
-Your task is to analyze user prompts and ${existingProfile ? "update" : "create"} a comprehensive user profile.
-
-CRITICAL: Detect the language used by the user in their prompts. You MUST output all descriptions, categories, and text in the SAME language as the user's prompts.
-
-CRITICAL: All JSON string values MUST escape double quotes with backslash. Do NOT use unescaped quotation marks inside string values.
-
-Use the update_user_profile tool to save the ${existingProfile ? "updated" : "new"} profile.`;
-
   const toolSchema = createUserProfileToolSchema(Boolean(existingProfile));
 
   const result = await provider.executeToolCall(
-    systemPrompt,
+    buildProfileSystemPrompt(existingProfile, langName, "tool"),
     context,
     toolSchema,
     `user-profile-${Date.now()}`
@@ -806,6 +896,7 @@ If no clear chains, return { "paths": [] }.`;
             client: v2Client,
             providerID: CONFIG.opencodeProvider,
             modelID: CONFIG.opencodeModel,
+            ...(CONFIG.opencodeVariant ? { variant: CONFIG.opencodeVariant } : {}),
             systemPrompt,
             userPrompt,
             schema: z.object({
@@ -819,7 +910,10 @@ If no clear chains, return { "paths": [] }.`;
             }),
           }),
           new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("learning paths: opencode timeout")), 120000)
+            setTimeout(
+              () => reject(new Error("learning paths: opencode timeout")),
+              outerStructuredTimeoutMs(CONFIG.opencodeTimeoutMs)
+            )
           ),
         ])) as LearningPathsResult;
       }

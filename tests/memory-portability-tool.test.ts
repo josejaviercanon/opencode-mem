@@ -83,14 +83,17 @@ mock.module(${JSON.stringify(privacyUrl)}, () => ({
   stripPrivateContent: (value) => value,
   isFullyPrivate: () => false,
 }));
-mock.module(${JSON.stringify(autoCaptureUrl)}, () => ({ performAutoCapture: async () => {} }));
+mock.module(${JSON.stringify(autoCaptureUrl)}, () => ({
+  performAutoCapture: async () => {},
+  awaitCaptureDrain: async () => {},
+}));
 mock.module(${JSON.stringify(learningUrl)}, () => ({ performUserProfileLearning: async () => {} }));
 mock.module(${JSON.stringify(promptManagerUrl)}, () => ({ userPromptManager: { savePrompt() {} } }));
 mock.module(${JSON.stringify(webServerUrl)}, () => ({
   startWebServer: async () => null,
   WebServer: class {},
 }));
-mock.module(${JSON.stringify(loggerUrl)}, () => ({ log: () => {} }));
+mock.module(${JSON.stringify(loggerUrl)}, () => ({ log: () => {}, safeLog: () => {}, serializeError: (error) => ({ error: error instanceof Error ? error.message : String(error) }) }));
 mock.module(${JSON.stringify(languageUrl)}, () => ({ getLanguageName: () => "English" }));
 
 const { OpenCodeMemPlugin } = await import(${JSON.stringify(indexUrl)});

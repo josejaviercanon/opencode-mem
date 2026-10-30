@@ -1,21 +1,22 @@
-import {
-  copyFileSync,
-  existsSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { CONFIG } from "../config.js";
 import { extractScopeFromContainerTag } from "./memory-scope.js";
 import { getProjectTagInfo } from "./tags.js";
 import { ensureTursoReady } from "./turso/ready.js";
-import { acquireTursoOperationLock } from "./turso/operation-lock.js";
+import {
+  acquireTursoOperationLock,
+  isTursoLockOwnershipLostError,
+} from "./turso/operation-lock.js";
 import { tursoShardManager } from "./turso/shard-manager.js";
 import { tursoConnectionManager } from "./turso/connection-manager.js";
 import { tursoVectorSearch } from "./turso/vector-search.js";
-import { withSqliteFileLockRetry } from "./turso/sqlite-handle-release.js";
+import {
+  withSqliteFileLockRetry,
+  renameSqliteDatabase,
+  removeSqliteDatabase,
+  copySqliteDatabase,
+} from "./turso/sqlite-handle-release.js";
 import { log } from "./logger.js";
 import {
   shardInventoryService,
@@ -104,7 +105,7 @@ async function countLiveMemories(dbPath: string): Promise<number> {
 async function removeFile(path: string): Promise<void> {
   await tursoConnectionManager.closeConnection(path);
   if (existsSync(path)) {
-    await withSqliteFileLockRetry(() => unlinkSync(path));
+    await withSqliteFileLockRetry(() => removeSqliteDatabase(path));
   }
 }
 
@@ -282,13 +283,14 @@ export class ShardPathMigrationService {
 
     try {
       // Stage complete, updated copies while originals remain untouched.
+      // A gigantic shard's synchronous copy or single UPDATE/count can still delay a heartbeat.
       for (const move of moves) {
         await tursoConnectionManager.closeConnection(move.oldPath);
         if (!existsSync(move.oldPath)) {
           throw new Error(`Source shard file missing: ${move.oldPath}`);
         }
         await removeFile(move.stagedPath);
-        copyFileSync(move.oldPath, move.stagedPath);
+        copySqliteDatabase(move.oldPath, move.stagedPath);
 
         const stagedDb = await tursoConnectionManager.getConnection(move.stagedPath);
         await tursoVectorSearch.updateProjectAssociation(stagedDb, move.oldContainerTag, {
@@ -319,9 +321,11 @@ export class ShardPathMigrationService {
           );
         }
         await tursoConnectionManager.closeConnection(move.stagedPath);
+        releaseLock.heartbeat();
       }
 
       writeSwapState(statePath, state);
+      releaseLock.heartbeat();
 
       // Empty targets remain recoverable until the complete swap succeeds.
       for (let index = 0; index < targetShards.length; index++) {
@@ -330,17 +334,20 @@ export class ShardPathMigrationService {
           "pre-path-migrate",
           archivedTargets[index]!.archivePath!
         );
+        releaseLock.heartbeat();
       }
 
       for (const move of moves) {
         await tursoConnectionManager.closeConnection(move.oldPath);
-        await withSqliteFileLockRetry(() => renameSync(move.oldPath, move.backupPath));
+        releaseLock.heartbeat();
+        await withSqliteFileLockRetry(() => renameSqliteDatabase(move.oldPath, move.backupPath));
         try {
-          await withSqliteFileLockRetry(() => renameSync(move.stagedPath, move.newPath));
+          await withSqliteFileLockRetry(() => renameSqliteDatabase(move.stagedPath, move.newPath));
         } catch (error) {
-          await withSqliteFileLockRetry(() => renameSync(move.backupPath, move.oldPath));
+          await withSqliteFileLockRetry(() => renameSqliteDatabase(move.backupPath, move.oldPath));
           throw error;
         }
+        releaseLock.heartbeat();
 
         await tursoShardManager.reassignShardScope(
           move.shardId,
@@ -356,6 +363,7 @@ export class ShardPathMigrationService {
       }
 
       unlinkSync(statePath);
+      releaseLock.heartbeat();
 
       // Prompt metadata is secondary and must not invalidate a completed,
       // recoverable memory migration.
@@ -382,12 +390,26 @@ export class ShardPathMigrationService {
         actions,
       };
     } catch (error) {
-      await this.rollbackSwap(state, statePath);
+      const ownershipLost = isTursoLockOwnershipLostError(error);
+      if (ownershipLost) {
+        // A successor may already be writing to the migrated paths. Only fresh
+        // ownership at startup may recover any journal that remains.
+        log(
+          "WARNING: Path migration interrupted after lock ownership lost; leaving recoverable state untouched",
+          { error: String(error), statePath }
+        );
+      } else {
+        await this.rollbackSwap(state, statePath);
+      }
       return {
         success: false,
         ...resultBase,
         dryRun: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: ownershipLost
+          ? `Path migration interrupted after lock ownership lost and may have completed; state is recoverable. ${String(error)}`
+          : error instanceof Error
+            ? error.message
+            : String(error),
       };
     } finally {
       releaseLock();
@@ -404,7 +426,7 @@ export class ShardPathMigrationService {
         if (existsSync(move.backupPath)) {
           await removeFile(move.newPath);
           await removeFile(move.oldPath);
-          await withSqliteFileLockRetry(() => renameSync(move.backupPath, move.oldPath));
+          await withSqliteFileLockRetry(() => renameSqliteDatabase(move.backupPath, move.oldPath));
         }
         await removeFile(move.stagedPath);
         if (existsSync(move.oldPath)) {
@@ -427,7 +449,7 @@ export class ShardPathMigrationService {
         if (archived.archivePath && existsSync(archived.archivePath)) {
           await removeFile(archived.originalPath);
           await withSqliteFileLockRetry(() =>
-            renameSync(archived.archivePath!, archived.originalPath)
+            renameSqliteDatabase(archived.archivePath!, archived.originalPath)
           );
           await tursoShardManager.registerExistingShard(
             "project",

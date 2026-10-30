@@ -10,9 +10,15 @@ import {
   type MemoryScopeRef,
 } from "./memory-scope.js";
 import { CONFIG } from "../config.js";
-import { log } from "./logger.js";
+import { log, serializeError } from "./logger.js";
 import type { MemoryType } from "../types/index.js";
-import type { MemoryRecord } from "./turso/types.js";
+import type { MemoryListFilters, MemoryRecord } from "./turso/types.js";
+import {
+  deleteMemoryMarkdownFile,
+  isMarkdownBackend,
+  writeMemoryMarkdownFile,
+} from "./markdown/backend.js";
+import { pluginMemoryRelPath } from "./markdown/vault.js";
 
 export type MemoryScope = "project" | "all-projects";
 
@@ -105,9 +111,14 @@ export class LocalMemoryClient {
   }
 
   async close(): Promise<void> {
-    const { closeTursoAndInvalidateCaches } = await import("./turso/lifecycle.js");
-    await closeTursoAndInvalidateCaches();
-    this.reset();
+    // Release one plugin-instance lease. Only the last live instance closes the
+    // process-wide Turso pool — otherwise a disposing session races sibling
+    // idle handlers with "database connection is not open" (#443).
+    const { releasePluginTurso } = await import("./turso/lifecycle.js");
+    const closed = await releasePluginTurso();
+    if (closed) {
+      this.reset();
+    }
   }
 
   async searchMemories(query: string, containerTag: string, scope: MemoryScope = "project") {
@@ -169,14 +180,17 @@ export class LocalMemoryClient {
       [key: string]: unknown;
     }
   ) {
+    let phase: "embed" | "embed_tags" | "write" = "embed";
     try {
       await this.initialize();
 
       const tags = metadata?.tags || [];
+      phase = "embed";
       const vector = await embeddingService.embedWithTimeout(content, { task: "document" });
       let tagsVector: Float32Array | undefined = undefined;
 
       if (tags.length > 0) {
+        phase = "embed_tags";
         tagsVector = await embeddingService.embedWithTimeout(formatTagsForEmbedding(tags), {
           task: "document",
         });
@@ -184,7 +198,8 @@ export class LocalMemoryClient {
 
       const { scope, hash } = extractScopeFromContainerTag(containerTag);
 
-      return tursoShardManager.withScopeWriteLock(scope, hash, async () => {
+      phase = "write";
+      return await tursoShardManager.withScopeWriteLock(scope, hash, async () => {
         const shard = await tursoShardManager.getWriteShard(scope, hash);
 
         const id = `mem_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -202,6 +217,25 @@ export class LocalMemoryClient {
           ...dynamicMetadata
         } = metadata || {};
 
+        const sessionId =
+          typeof dynamicMetadata.sessionID === "string" ? dynamicMetadata.sessionID : undefined;
+
+        if (isMarkdownBackend()) {
+          writeMemoryMarkdownFile({
+            id,
+            content,
+            type,
+            tags,
+            containerTag,
+            createdAt: now,
+            updatedAt: now,
+            source: typeof dynamicMetadata.source === "string" ? dynamicMetadata.source : "manual",
+            title: displayName,
+          });
+          dynamicMetadata.markdownRelPath = pluginMemoryRelPath(id);
+          if (!dynamicMetadata.source) dynamicMetadata.source = "manual";
+        }
+
         const record: MemoryRecord = {
           id,
           content,
@@ -218,6 +252,7 @@ export class LocalMemoryClient {
           projectPath,
           projectName,
           gitRepoUrl,
+          sessionId,
           metadata:
             Object.keys(dynamicMetadata).length > 0 ? JSON.stringify(dynamicMetadata) : undefined,
         };
@@ -232,9 +267,9 @@ export class LocalMemoryClient {
         };
       });
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      log("addMemory: error", { error: errorMessage });
-      return { success: false as const, error: errorMessage };
+      const serialized = serializeError(error);
+      log("addMemory: error", { phase, ...serialized });
+      return { success: false as const, error: serialized.error };
     }
   }
 
@@ -251,10 +286,20 @@ export class LocalMemoryClient {
         const memory = await tursoVectorSearch.getMemoryById(db, memoryId);
 
         if (memory) {
+          if (isMarkdownBackend()) {
+            const meta = safeJSONParse(memory.metadata);
+            const rel =
+              meta && typeof meta.markdownRelPath === "string" ? meta.markdownRelPath : null;
+            deleteMemoryMarkdownFile(memoryId, rel);
+          }
           await tursoVectorSearch.deleteVector(db, memoryId);
           await tursoShardManager.decrementVectorCount(shard.id);
           return { success: true };
         }
+      }
+
+      if (isMarkdownBackend()) {
+        deleteMemoryMarkdownFile(memoryId);
       }
 
       return { success: false, error: "Memory not found" };
@@ -265,7 +310,12 @@ export class LocalMemoryClient {
     }
   }
 
-  async listMemories(containerTag: string, limit = 20, scope: MemoryScope = "project") {
+  async listMemories(
+    containerTag: string,
+    limit = 20,
+    scope: MemoryScope = "project",
+    filters: MemoryListFilters = {}
+  ) {
     try {
       await this.initialize();
 
@@ -291,14 +341,23 @@ export class LocalMemoryClient {
         const memories = await tursoVectorSearch.listMemories(
           db,
           scope === "all-projects" ? "" : containerTag,
-          limit
+          limit,
+          filters
         );
         allMemories.push(...memories);
       }
 
-      allMemories.sort((a, b) => Number(b.created_at) - Number(a.created_at));
+      // Match per-shard SQL (is_pinned DESC, created_at DESC) when selecting the
+      // merged limit, then present the chosen rows by recency for injection order.
+      allMemories.sort((a, b) => {
+        const pinDiff = Number(b.is_pinned ?? 0) - Number(a.is_pinned ?? 0);
+        if (pinDiff !== 0) return pinDiff;
+        return Number(b.created_at) - Number(a.created_at);
+      });
+      const selected = allMemories.slice(0, limit);
+      selected.sort((a, b) => Number(b.created_at) - Number(a.created_at));
 
-      const memories = allMemories.slice(0, limit).map((r: any) => ({
+      const memories = selected.map((r: any) => ({
         id: r.id,
         summary: r.content,
         createdAt: safeToISOString(r.created_at),

@@ -3,16 +3,22 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { CONFIG } from "../../config.js";
 import { log } from "../logger.js";
 import { tursoConnectionManager } from "./connection-manager.js";
 import { tursoShardManager } from "./shard-manager.js";
-import { withSqliteFileLockRetry } from "./sqlite-handle-release.js";
+import { runTursoEngineMigration } from "./engine-migrator.js";
+import { heartbeatTursoLock, readLiveTursoLock, releaseTursoLock } from "./operation-lock.js";
+import {
+  withSqliteFileLockRetry,
+  renameSqliteDatabase,
+  removeSqliteDatabase,
+} from "./sqlite-handle-release.js";
 import { tursoVectorSearch } from "./vector-search.js";
 import { blobToFloat32Array } from "./vector-utils.js";
 import type { MemoryRecord } from "./types.js";
@@ -38,6 +44,7 @@ interface MigrationMarker {
 }
 
 interface MigrationLock {
+  id: string;
   pid: number;
   timestamp: string;
 }
@@ -87,50 +94,35 @@ function writeMarker(storagePath: string, shards: MigrationMarker["shards"]): vo
   writeFileSync(join(storagePath, MIGRATION_MARKER), JSON.stringify(marker, null, 2), "utf-8");
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function acquireMigrationLock(storagePath: string): boolean {
+function acquireMigrationLock(storagePath: string): string | null {
   const lockPath = join(storagePath, MIGRATION_LOCK);
-  if (existsSync(lockPath)) {
-    try {
-      const lock = JSON.parse(readFileSync(lockPath, "utf-8")) as MigrationLock;
-      if (lock.pid && isProcessAlive(lock.pid)) {
-        return false;
-      }
-      unlinkSync(lockPath);
-    } catch {
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // stale or corrupt lock — try atomic create below
-      }
-    }
-  }
+  if (readLiveTursoLock(lockPath)) return null;
 
-  const lock: MigrationLock = { pid: process.pid, timestamp: new Date().toISOString() };
+  const lock: MigrationLock = {
+    id: randomUUID(),
+    pid: process.pid,
+    timestamp: new Date().toISOString(),
+  };
   try {
     writeFileSync(lockPath, JSON.stringify(lock), { flag: "wx" });
-    return true;
+    return lock.id;
   } catch {
-    return false;
+    return null;
   }
 }
 
-async function acquireMigrationLockWithRetry(storagePath: string, maxAttempts = 3): Promise<void> {
+async function acquireMigrationLockWithRetry(
+  storagePath: string,
+  maxAttempts = 3
+): Promise<string> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (acquireMigrationLock(storagePath)) {
-      return;
+    const id = acquireMigrationLock(storagePath);
+    if (id) {
+      return id;
     }
     await sleep(200 + attempt * 150);
   }
@@ -138,17 +130,8 @@ async function acquireMigrationLockWithRetry(storagePath: string, maxAttempts = 
   throw new Error("Turso legacy migration locked by another process");
 }
 
-function releaseMigrationLock(storagePath: string): void {
-  const lockPath = join(storagePath, MIGRATION_LOCK);
-  if (!existsSync(lockPath)) return;
-  try {
-    const lock = JSON.parse(readFileSync(lockPath, "utf-8")) as MigrationLock;
-    if (lock.pid === process.pid) {
-      unlinkSync(lockPath);
-    }
-  } catch {
-    unlinkSync(lockPath);
-  }
+function releaseMigrationLock(storagePath: string, id: string): void {
+  releaseTursoLock(join(storagePath, MIGRATION_LOCK), id);
 }
 
 async function countMemories(db: TursoDb): Promise<number> {
@@ -162,31 +145,26 @@ async function hasMemoriesTable(db: TursoDb): Promise<boolean> {
 }
 
 async function isTursoVectorShardReady(db: TursoDb): Promise<boolean> {
-  const indexRow = await db.get(
-    `SELECT name FROM sqlite_master WHERE type='index' AND name='memories_vec_idx'`
-  );
-  if (!indexRow) {
-    return false;
-  }
-
-  const metaRow = await db.get(
-    `SELECT value FROM shard_metadata WHERE key = 'embedding_dimensions'`
-  );
-  if (!metaRow?.value) {
-    return false;
-  }
-
-  const storedDimensions = Number(metaRow.value);
-  if (!Number.isInteger(storedDimensions) || storedDimensions <= 0) {
-    return false;
-  }
-
-  const count = await countMemories(db);
-  if (count === 0) {
-    return true;
-  }
-
+  // DiskANN indexes are not used on @tursodatabase/database; readiness is
+  // F32_BLOB + vector_extract with matching embedding dimensions.
   try {
+    const metaRow = await db.get(
+      `SELECT value FROM shard_metadata WHERE key = 'embedding_dimensions'`
+    );
+    if (!metaRow?.value) {
+      return false;
+    }
+
+    const storedDimensions = Number(metaRow.value);
+    if (!Number.isInteger(storedDimensions) || storedDimensions <= 0) {
+      return false;
+    }
+
+    const count = await countMemories(db);
+    if (count === 0) {
+      return true;
+    }
+
     const probe = await db.get(`SELECT vector_extract(vector) AS extracted FROM memories LIMIT 1`);
     if (probe?.extracted == null) return false;
     const extracted = JSON.parse(String(probe.extracted)) as unknown;
@@ -211,11 +189,9 @@ async function isShardMigrationComplete(dbPath: string): Promise<boolean> {
     if (!(await hasMemoriesTable(db))) {
       return sidecar.expectedCount === 0;
     }
-    const count = await countMemories(db);
-    if (count !== sidecar.expectedCount) {
-      return false;
-    }
-    // Sidecar alone is not enough — require native vector index + readable vectors.
+    // Counts are verified before publishing the complete sidecar. Normal
+    // inserts and deletes must not invalidate that historical migration fact.
+    // Sidecar alone is not enough — still require native, readable vectors.
     return isTursoVectorShardReady(db);
   } catch {
     return false;
@@ -229,10 +205,10 @@ async function restoreFromBackup(dbPath: string): Promise<void> {
   await tursoConnectionManager.closeConnection(dbPath);
 
   if (existsSync(dbPath)) {
-    await withSqliteFileLockRetry(() => unlinkSync(dbPath));
+    await withSqliteFileLockRetry(() => removeSqliteDatabase(dbPath));
   }
 
-  await withSqliteFileLockRetry(() => renameSync(backup, dbPath));
+  await withSqliteFileLockRetry(() => renameSqliteDatabase(backup, dbPath));
 
   const sidecarPathFile = sidecarPath(dbPath);
   if (existsSync(sidecarPathFile)) {
@@ -305,6 +281,7 @@ function rowToRecord(row: Record<string, unknown>): MemoryRecord | null {
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     metadata: row.metadata ? String(row.metadata) : undefined,
+    sessionId: row.session_id ? String(row.session_id) : undefined,
     displayName: row.display_name ? String(row.display_name) : undefined,
     userName: row.user_name ? String(row.user_name) : undefined,
     userEmail: row.user_email ? String(row.user_email) : undefined,
@@ -314,7 +291,10 @@ function rowToRecord(row: Record<string, unknown>): MemoryRecord | null {
   };
 }
 
-async function migrateMemoryShard(dbPath: string): Promise<ShardMigrationSidecar | null> {
+async function migrateMemoryShard(
+  dbPath: string,
+  heartbeatMigrationLock: () => void
+): Promise<ShardMigrationSidecar | null> {
   if (await isShardMigrationComplete(dbPath)) {
     const sidecar = readSidecar(dbPath);
     return sidecar;
@@ -411,6 +391,7 @@ async function migrateMemoryShard(dbPath: string): Promise<ShardMigrationSidecar
   }
 
   const expectedCount = records.length;
+  heartbeatMigrationLock();
   writeSidecar(dbPath, {
     sourceCount,
     expectedCount,
@@ -421,8 +402,9 @@ async function migrateMemoryShard(dbPath: string): Promise<ShardMigrationSidecar
 
   const backup = backupPath(dbPath);
   await tursoConnectionManager.closeConnection(dbPath);
+  heartbeatMigrationLock();
   if (existsSync(dbPath)) {
-    await withSqliteFileLockRetry(() => renameSync(dbPath, backup));
+    await withSqliteFileLockRetry(() => renameSqliteDatabase(dbPath, backup));
   }
 
   const freshDb = await tursoConnectionManager.getConnection(dbPath);
@@ -437,6 +419,7 @@ async function migrateMemoryShard(dbPath: string): Promise<ShardMigrationSidecar
       for (const record of batch) {
         await tursoVectorSearch.insertVectorInTransaction(tx, record);
       }
+      heartbeatMigrationLock();
     }
     for (const memoryId of pinnedIds) {
       await tx.execute({
@@ -460,6 +443,7 @@ async function migrateMemoryShard(dbPath: string): Promise<ShardMigrationSidecar
     skippedCount,
     status: "complete",
   };
+  heartbeatMigrationLock();
   writeSidecar(dbPath, completedSidecar);
 
   log("Legacy memory shard migrated to Turso vectors", {
@@ -472,7 +456,8 @@ async function migrateMemoryShard(dbPath: string): Promise<ShardMigrationSidecar
 }
 
 async function migrateDirectory(
-  dirName: "users" | "projects"
+  dirName: "users" | "projects",
+  heartbeatMigrationLock: () => void
 ): Promise<Array<{ path: string; sidecar: ShardMigrationSidecar }>> {
   const dir = join(CONFIG.storagePath, dirName);
   const results: Array<{ path: string; sidecar: ShardMigrationSidecar }> = [];
@@ -480,11 +465,13 @@ async function migrateDirectory(
 
   for (const file of readdirSync(dir)) {
     if (!file.endsWith(".db") || file.includes(BACKUP_SUFFIX)) continue;
+    heartbeatMigrationLock();
     const dbPath = join(dir, file);
-    const sidecar = await migrateMemoryShard(dbPath);
+    const sidecar = await migrateMemoryShard(dbPath, heartbeatMigrationLock);
     if (sidecar) {
       results.push({ path: dbPath, sidecar });
     }
+    heartbeatMigrationLock();
   }
 
   return results;
@@ -514,7 +501,7 @@ async function allShardsComplete(): Promise<boolean> {
   return true;
 }
 
-function recoverInterruptedReembedSwaps(): void {
+async function recoverInterruptedReembedSwaps(): Promise<void> {
   for (const dirName of ["users", "projects"] as const) {
     const dir = join(CONFIG.storagePath, dirName);
     if (!existsSync(dir)) continue;
@@ -544,11 +531,21 @@ function recoverInterruptedReembedSwaps(): void {
         }
 
         if (existsSync(expectedDbPath)) {
-          if (existsSync(stagedPath)) unlinkSync(stagedPath);
+          if (existsSync(stagedPath)) {
+            await withSqliteFileLockRetry(() => removeSqliteDatabase(stagedPath));
+          }
         } else if (existsSync(stagedPath)) {
-          renameSync(stagedPath, expectedDbPath);
+          // Target is absent after a crash mid-swap; retry covers Windows EPERM
+          // while native handles release (same pattern as engine/encryption swaps).
+          await withSqliteFileLockRetry(() => {
+            if (existsSync(expectedDbPath)) removeSqliteDatabase(expectedDbPath);
+            renameSqliteDatabase(stagedPath, expectedDbPath);
+          });
         } else if (existsSync(backupPath)) {
-          renameSync(backupPath, expectedDbPath);
+          await withSqliteFileLockRetry(() => {
+            if (existsSync(expectedDbPath)) removeSqliteDatabase(expectedDbPath);
+            renameSqliteDatabase(backupPath, expectedDbPath);
+          });
         } else {
           throw new Error("neither staged replacement nor source backup exists");
         }
@@ -613,7 +610,12 @@ export async function runLegacyTursoMigration(): Promise<void> {
     mkdirSync(CONFIG.storagePath, { recursive: true });
   }
 
-  recoverInterruptedReembedSwaps();
+  await recoverInterruptedReembedSwaps();
+
+  // Recovery may put a libSQL shard back at its active path. Convert DiskANN
+  // indexes before any legacy verification opens it with the Turso engine,
+  // and before taking the legacy lock that would block the engine migration.
+  await runTursoEngineMigration();
 
   const marker = readMarker(CONFIG.storagePath);
   if (marker && (await allShardsComplete())) {
@@ -621,9 +623,12 @@ export async function runLegacyTursoMigration(): Promise<void> {
     return;
   }
 
-  await acquireMigrationLockWithRetry(CONFIG.storagePath);
+  const lockId = await acquireMigrationLockWithRetry(CONFIG.storagePath);
+  const heartbeatMigrationLock = () =>
+    heartbeatTursoLock(join(CONFIG.storagePath, MIGRATION_LOCK), lockId);
 
   try {
+    heartbeatMigrationLock();
     const dbFiles = ["metadata.db", "user-prompts.db", "user-profiles.db", "ai-sessions.db"];
     for (const file of dbFiles) {
       const path = join(CONFIG.storagePath, file);
@@ -634,7 +639,7 @@ export async function runLegacyTursoMigration(): Promise<void> {
     const migratedShards: MigrationMarker["shards"] = [];
 
     for (const dirName of ["users", "projects"] as const) {
-      const dirResults = await migrateDirectory(dirName);
+      const dirResults = await migrateDirectory(dirName, heartbeatMigrationLock);
       for (const { path, sidecar } of dirResults) {
         migratedShards.push({
           path,
@@ -648,10 +653,12 @@ export async function runLegacyTursoMigration(): Promise<void> {
       throw new Error("Turso legacy migration incomplete: not all shards verified");
     }
 
+    heartbeatMigrationLock();
     await reconcileShardRegistry();
+    heartbeatMigrationLock();
     writeMarker(CONFIG.storagePath, migratedShards);
     log("Turso legacy migration complete", { storagePath: CONFIG.storagePath });
   } finally {
-    releaseMigrationLock(CONFIG.storagePath);
+    releaseMigrationLock(CONFIG.storagePath, lockId);
   }
 }

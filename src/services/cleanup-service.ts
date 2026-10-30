@@ -13,6 +13,7 @@ interface CleanupResult {
   promptsDeleted: number;
   linkedMemoriesDeleted: number;
   pinnedMemoriesSkipped: number;
+  aiSessionsDeleted: number;
 }
 
 export class CleanupService {
@@ -111,6 +112,15 @@ export class CleanupService {
         log("Cleanup: VACUUM skipped (DB busy)", { error: String(err) });
       }
 
+      let aiSessionsDeleted = 0;
+      try {
+        const { AIProviderFactory } = await import("./ai/ai-provider-factory.js");
+        aiSessionsDeleted = await AIProviderFactory.cleanupExpiredSessions();
+        log("Cleanup: expired AI sessions deleted", { aiSessionsDeleted });
+      } catch (err) {
+        log("Cleanup: AI session cleanup failed", { error: String(err) });
+      }
+
       return {
         deletedCount: totalDeleted,
         userCount: userDeleted,
@@ -118,6 +128,7 @@ export class CleanupService {
         promptsDeleted,
         linkedMemoriesDeleted,
         pinnedMemoriesSkipped: pinnedSkipped,
+        aiSessionsDeleted,
       };
     } finally {
       this.isRunning = false;

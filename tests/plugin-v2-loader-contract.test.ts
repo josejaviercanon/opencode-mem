@@ -18,9 +18,23 @@ describe("OpenCode v2 plugin-loader contract", () => {
     expect(pkg.files).toContain("dist");
   });
 
+  it("publishes the TUI companion entrypoint", () => {
+    const pkg = readPackageJson();
+    expect(pkg.exports?.["./tui"]).toEqual({
+      import: "./dist/tui.js",
+      types: "./dist/tui.d.ts",
+    });
+  });
+
   it("exports a native v2 plugin definition", async () => {
     const mod = await import(new URL("../dist/v2/plugin.js", import.meta.url).href);
     expect(mod.default.id).toBe("opencode-mem");
+    expect(typeof mod.default.setup).toBe("function");
+  });
+
+  it("exports a TUI companion plugin definition", async () => {
+    const mod = await import(new URL("../dist/tui.js", import.meta.url).href);
+    expect(mod.default.id).toBe("opencode-mem-tui");
     expect(typeof mod.default.setup).toBe("function");
   });
 

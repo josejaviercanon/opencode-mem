@@ -2,7 +2,7 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import { randomUUID } from "node:crypto";
 import { memoryClient } from "./client.js";
 import { getTags } from "./tags.js";
-import { log } from "./logger.js";
+import { log, serializeError } from "./logger.js";
 import { CONFIG } from "../config.js";
 import { userPromptManager, type UserPrompt } from "./user-prompt/user-prompt-manager.js";
 import { loadOpencodeProvider } from "./ai/opencode-provider-loader.js";
@@ -21,32 +21,67 @@ const SUMMARY_REQUEST_OVERHEAD_BYTES = 1024;
 const SUMMARY_OUTPUT_RESERVE_BYTES = 16384;
 const SUMMARY_ANALYSIS_SUFFIX = `Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary and relevant tags. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
 
-let isCaptureRunning = false;
+// Serializes captures across sessions. Replacing the old module-wide boolean
+// (which silently dropped any session whose idle fired while another capture
+// was in flight — a finished session then never got summarized), jobs now
+// queue behind the running one. The chain itself never rejects so one failed
+// job cannot poison the next; each caller still observes its own job's
+// actual outcome.
+let captureChain: Promise<void> = Promise.resolve();
+
+export interface PerformAutoCaptureOptions {
+  /**
+   * Skip this job if it has not started yet once the signal aborts (e.g. the
+   * plugin is disposing). In-flight captures are NOT cancelled: model
+   * requests were never cancellable and keep their original semantics.
+   */
+  signal?: AbortSignal;
+}
 
 export async function performAutoCapture(
   ctx: PluginInput,
   sessionID: string,
+  directory: string,
+  options: PerformAutoCaptureOptions = {}
+): Promise<void> {
+  const run = async () => {
+    if (options.signal?.aborted) return;
+    await runAutoCapture(ctx, sessionID, directory);
+  };
+
+  const next = captureChain.then(run, run);
+  // Keep the chain alive regardless of this job's outcome; `next` still
+  // rejects to the caller when their own job failed.
+  captureChain = next.catch(() => {});
+  return next;
+}
+
+/**
+ * Wait until every capture job that has already been enqueued finishes.
+ * Used by plugin dispose so the last `memoryClient.close()` (refcount → 0)
+ * does not race an in-flight capture that was intentionally left uncancellable.
+ */
+export function awaitCaptureDrain(): Promise<void> {
+  return captureChain;
+}
+
+async function runAutoCapture(
+  ctx: PluginInput,
+  sessionID: string,
   directory: string
 ): Promise<void> {
-  if (isCaptureRunning) return;
-  isCaptureRunning = true;
+  const prompts = await userPromptManager.getUncapturedPromptsForSession(sessionID);
+  if (prompts.length === 0) {
+    return;
+  }
 
-  try {
-    const prompts = await userPromptManager.getUncapturedPromptsForSession(sessionID);
-    if (prompts.length === 0) {
-      return;
-    }
+  if (!CONFIG.autoCaptureProviderStatus.ready) {
+    return;
+  }
 
-    if (!CONFIG.autoCaptureProviderStatus.ready) {
-      return;
-    }
-
-    const maxRetries = CONFIG.autoCaptureMaxRetries ?? 3;
-    for (const prompt of prompts) {
-      await capturePrompt(ctx, sessionID, directory, prompt, maxRetries);
-    }
-  } finally {
-    isCaptureRunning = false;
+  const maxRetries = CONFIG.autoCaptureMaxRetries ?? 3;
+  for (const prompt of prompts) {
+    await capturePrompt(ctx, sessionID, directory, prompt, maxRetries);
   }
 }
 
@@ -59,6 +94,7 @@ async function capturePrompt(
 ): Promise<void> {
   let claimedPromptId: string | null = null;
   let attempt = prompt.capture_attempts || 0;
+  let phase: "claim" | "context" | "summary" | "persist" = "claim";
 
   try {
     if (!(await userPromptManager.claimPrompt(prompt.id))) {
@@ -73,6 +109,7 @@ async function capturePrompt(
           throw new Error("Client not available");
         }
 
+        phase = "context";
         const response = await ctx.client.session.messages({
           path: { id: sessionID },
         });
@@ -105,6 +142,7 @@ async function capturePrompt(
           getAutoCaptureMarkdownBudget()
         );
 
+        phase = "summary";
         let summaryResult: { summary: string; type: string; tags: string[] } | null;
         try {
           summaryResult = await generateSummary(ctx, context, sessionID, prompt.content, prompt);
@@ -129,6 +167,7 @@ async function capturePrompt(
             ? `${summaryResult.summary}\n\nTags: ${summaryResult.tags.join(", ")}`
             : summaryResult.summary;
 
+        phase = "persist";
         const result = await memoryClient.addMemory(summaryWithTags, tags.project.tag, {
           source: "auto-capture" as any,
           type: summaryResult.type as any,
@@ -171,12 +210,13 @@ async function capturePrompt(
           throw new Error(`Memory persistence failed: ${result.error || "database write failed"}`);
         }
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-
         await userPromptManager.recordFailedAttempt(prompt.id);
 
         if (attempt < maxRetries) {
-          log(`Auto-capture warning (attempt ${attempt}/${maxRetries})`, { error: errMsg });
+          log(`Auto-capture warning (attempt ${attempt}/${maxRetries})`, {
+            phase,
+            ...serializeError(error),
+          });
           await new Promise((resolve) =>
             setTimeout(resolve, RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1))
           );
@@ -187,7 +227,10 @@ async function capturePrompt(
     }
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
-    log(`Auto-capture final error after ${attempt} attempts`, { error: errMsg });
+    log(`Auto-capture final error after ${attempt} attempts`, {
+      phase,
+      ...serializeError(error),
+    });
     if (CONFIG.showErrorToasts) {
       const shortReason = errMsg.length > 100 ? errMsg.substring(0, 100) + "..." : errMsg;
       await ctx.client?.tui
@@ -228,7 +271,7 @@ function getAIResponseMessages(messages: any[], promptMessageId: string): any[] 
   return responseMessages;
 }
 
-function extractAIContent(messages: any[]): {
+export function extractAIContent(messages: any[]): {
   textResponses: string[];
   toolCalls: ToolCallInfo[];
 } {
@@ -250,7 +293,7 @@ function extractAIContent(messages: any[]): {
 
     const toolParts = msg.parts.filter((p: any) => p.type === "tool");
     for (const tool of toolParts) {
-      const name = tool.tool || "unknown";
+      const name = tool.name || tool.tool || "unknown";
       let input = "";
 
       if (tool.state?.input) {
@@ -478,61 +521,23 @@ export function buildMarkdownContext(
   return truncateToMaxBytes(result, maxContextBytes, CONTEXT_TRUNCATION_MARKER);
 }
 
-async function generateSummary(
-  ctx: PluginInput,
-  context: string,
-  sessionID: string,
-  userPrompt: string,
-  prompt?: { id?: string; providerId: string | null; modelId: string | null }
-): Promise<{ summary: string; type: string; tags: string[] } | null> {
-  let opencodeProviderError: unknown;
+type CaptureSummary = { summary: string; type: string; tags: string[] };
+type CaptureChannel = "opencode" | "external";
 
-  // Opencode provider path (when opencodeProvider + opencodeModel configured)
-  if (CONFIG.opencodeProvider && CONFIG.opencodeModel) {
-    try {
-      if (CONFIG.memoryModel) {
-        log("opencodeProvider takes precedence over memoryModel for auto-capture");
-      }
+function isOpencodeCaptureConfigured(): boolean {
+  return Boolean(CONFIG.opencodeProvider && CONFIG.opencodeModel);
+}
 
-      const { isProviderConnected, getV2Client, generateStructuredOutput } =
-        await loadOpencodeProvider();
+function isExternalCaptureConfigured(): boolean {
+  return Boolean(CONFIG.memoryModel && CONFIG.memoryApiUrl);
+}
 
-      // "inherit" resolves to the model opencode used for the captured prompt
-      // (recorded by the chat.params hook). Without a concrete model id, the
-      // provider path cannot issue a structured-output request.
-      let providerID = CONFIG.opencodeProvider;
-      let modelID = CONFIG.opencodeModel;
-      if (modelID === "inherit") {
-        if (!prompt?.providerId || !prompt?.modelId) {
-          throw new Error(
-            "opencode-mem: opencodeModel is 'inherit' but no session model was recorded for this prompt"
-          );
-        }
-        providerID = prompt.providerId;
-        modelID = prompt.modelId;
-      }
+function isChannelConfigured(channel: CaptureChannel): boolean {
+  return channel === "opencode" ? isOpencodeCaptureConfigured() : isExternalCaptureConfigured();
+}
 
-      if (!isProviderConnected(providerID)) {
-        throw new Error(
-          `opencode provider '${providerID}' is not connected. Check your opencode provider configuration.`
-        );
-      }
-
-      const v2Client = getV2Client();
-      if (!v2Client) {
-        throw new Error(
-          "opencode-mem: v2 client not initialized; cannot perform structured-output capture"
-        );
-      }
-
-      const { detectLanguage, getLanguageName } = await import("./language-detector.js");
-      const targetLang =
-        CONFIG.autoCaptureLanguage === "auto" || !CONFIG.autoCaptureLanguage
-          ? detectLanguage(userPrompt)
-          : CONFIG.autoCaptureLanguage;
-      const langName = getLanguageName(targetLang);
-
-      const systemPrompt = `You are a technical memory recorder for a software development project.
+function buildCaptureSystemPrompt(langName: string): string {
+  return `You are a technical memory recorder for a software development project.
 
 RULES:
 1. ONLY capture technical work (code, bugs, features, architecture, config)
@@ -551,99 +556,113 @@ FORMAT:
 
 SKIP if: greetings, casual chat, no code/decisions made
 CAPTURE if: code changed, bug fixed, feature added, decision made`;
+}
 
-      const { z } = await import("zod");
-      const schema = z.object({
-        summary: z.string(),
-        type: z.string(),
-        tags: z.array(z.string()),
-      });
-      const aiPrompt = buildBoundedSummaryPrompt(context, systemPrompt, z.toJSONSchema(schema));
-
-      const result = await generateStructuredOutput({
-        client: v2Client,
-        providerID,
-        modelID,
-        systemPrompt,
-        userPrompt: aiPrompt,
-        schema,
-      });
-
-      return {
-        summary: result.summary,
-        type: result.type,
-        tags: (result.tags || []).map((t: string) => t.toLowerCase().trim()),
-      };
-    } catch (e) {
-      opencodeProviderError = e;
-      log("auto-capture: opencode provider failed, falling back to external API", {
-        error: String(e),
-      });
-    }
-  }
-
-  // Existing manual config path
-  if (!CONFIG.memoryModel || !CONFIG.memoryApiUrl) {
-    if (opencodeProviderError) {
-      throw opencodeProviderError;
-    }
-    throw new Error("External API not configured for auto-capture");
-  }
-
-  // Opencode provider failed but a manual fallback is configured — surface a
-  // non-blocking warning so the user knows their primary provider is broken.
-  if (opencodeProviderError && CONFIG.showErrorToasts) {
-    const errMsg =
-      opencodeProviderError instanceof Error
-        ? opencodeProviderError.message
-        : String(opencodeProviderError);
-    const shortReason = errMsg.length > 100 ? errMsg.substring(0, 100) + "..." : errMsg;
-    ctx.client?.tui
-      .showToast({
-        body: {
-          title: "Using fallback provider",
-          message: `OpenCode provider failed (${shortReason}); using configured fallback.`,
-          variant: "warning",
-          duration: 5000,
-        },
-      })
-      .catch(() => {});
-  }
-
-  const { AIProviderFactory } = await import("./ai/ai-provider-factory.js");
-  const { buildMemoryProviderConfig } = await import("./ai/provider-config.js");
+async function resolveCaptureLanguage(userPrompt: string): Promise<string> {
   const { detectLanguage, getLanguageName } = await import("./language-detector.js");
-
-  const providerConfig = buildMemoryProviderConfig(CONFIG);
-
-  const provider = AIProviderFactory.createProvider(CONFIG.memoryProvider, providerConfig);
-
   const targetLang =
     CONFIG.autoCaptureLanguage === "auto" || !CONFIG.autoCaptureLanguage
       ? detectLanguage(userPrompt)
       : CONFIG.autoCaptureLanguage;
+  return getLanguageName(targetLang);
+}
 
-  const langName = getLanguageName(targetLang);
+function showFallbackToast(ctx: PluginInput, failedChannel: CaptureChannel, error: unknown): void {
+  if (!CONFIG.showErrorToasts) return;
+  const errMsg = error instanceof Error ? error.message : String(error);
+  const shortReason = errMsg.length > 100 ? errMsg.substring(0, 100) + "..." : errMsg;
+  const label = failedChannel === "opencode" ? "OpenCode provider" : "External API";
+  ctx.client?.tui
+    .showToast({
+      body: {
+        title: "Using fallback provider",
+        message: `${label} failed (${shortReason}); using configured fallback.`,
+        variant: "warning",
+        duration: 5000,
+      },
+    })
+    .catch(() => {});
+}
 
-  const systemPrompt = `You are a technical memory recorder for a software development project.
+async function tryOpencodeSummary(
+  context: string,
+  userPrompt: string,
+  prompt?: { id?: string; providerId: string | null; modelId: string | null }
+): Promise<CaptureSummary> {
+  const { ensureProviderConnected, getV2Client, generateStructuredOutput } =
+    await loadOpencodeProvider();
 
-RULES:
-1. ONLY capture technical work (code, bugs, features, architecture, config)
-2. SKIP non-technical by returning type="skip"
-3. NO meta-commentary or behavior analysis
-4. Include specific file names, functions, technical details
-5. Generate 2-4 technical tags (e.g., "react", "auth", "bug-fix")
-6. You MUST write the summary in ${langName}.
+  // "inherit" resolves to the model opencode used for the captured prompt
+  // (recorded by the chat.params hook). Without a concrete model id, the
+  // provider path cannot issue a structured-output request.
+  let providerID = CONFIG.opencodeProvider!;
+  let modelID = CONFIG.opencodeModel!;
+  if (modelID === "inherit") {
+    if (!prompt?.providerId || !prompt?.modelId) {
+      throw new Error(
+        "opencode-mem: opencodeModel is 'inherit' but no session model was recorded for this prompt"
+      );
+    }
+    providerID = prompt.providerId;
+    modelID = prompt.modelId;
+  }
 
-FORMAT:
-## Request
-[1-2 sentences: what was requested, in ${langName}]
+  // One refresh-on-miss before failing: user-config providers register
+  // seconds after plugin setup, so the init snapshot may lag the host.
+  if (!(await ensureProviderConnected(providerID))) {
+    throw new Error(
+      `opencode provider '${providerID}' is not connected. Check your opencode provider configuration.`
+    );
+  }
 
-## Outcome
-[1-2 sentences: what was done, include files/functions, in ${langName}]
+  const v2Client = getV2Client();
+  if (!v2Client) {
+    throw new Error(
+      "opencode-mem: v2 client not initialized; cannot perform structured-output capture"
+    );
+  }
 
-SKIP if: greetings, casual chat, no code/decisions made
-CAPTURE if: code changed, bug fixed, feature added, decision made`;
+  const langName = await resolveCaptureLanguage(userPrompt);
+  const systemPrompt = buildCaptureSystemPrompt(langName);
+
+  const { z } = await import("zod");
+  const schema = z.object({
+    summary: z.string(),
+    type: z.string(),
+    tags: z.array(z.string()),
+  });
+  const aiPrompt = buildBoundedSummaryPrompt(context, systemPrompt, z.toJSONSchema(schema));
+
+  const result = await generateStructuredOutput({
+    client: v2Client,
+    providerID,
+    modelID,
+    ...(CONFIG.opencodeVariant ? { variant: CONFIG.opencodeVariant } : {}),
+    systemPrompt,
+    userPrompt: aiPrompt,
+    schema,
+  });
+
+  return {
+    summary: result.summary,
+    type: result.type,
+    tags: (result.tags || []).map((t: string) => t.toLowerCase().trim()),
+  };
+}
+
+async function tryExternalSummary(
+  context: string,
+  sessionID: string,
+  userPrompt: string,
+  prompt?: { id?: string; providerId: string | null; modelId: string | null }
+): Promise<CaptureSummary> {
+  const { AIProviderFactory } = await import("./ai/ai-provider-factory.js");
+  const { buildMemoryProviderConfig } = await import("./ai/provider-config.js");
+
+  const providerConfig = buildMemoryProviderConfig(CONFIG);
+  const provider = AIProviderFactory.createProvider(CONFIG.memoryProvider, providerConfig);
+  const langName = await resolveCaptureLanguage(userPrompt);
+  const systemPrompt = buildCaptureSystemPrompt(langName);
 
   const toolSchema = {
     type: "function" as const,
@@ -691,4 +710,56 @@ CAPTURE if: code changed, bug fixed, feature added, decision made`;
     type: result.data.type,
     tags: (result.data.tags || []).map((t: string) => t.toLowerCase().trim()),
   };
+}
+
+async function generateSummary(
+  ctx: PluginInput,
+  context: string,
+  sessionID: string,
+  userPrompt: string,
+  prompt?: { id?: string; providerId: string | null; modelId: string | null }
+): Promise<CaptureSummary | null> {
+  const order = CONFIG.autoCaptureProviderOrder ?? "opencode-first";
+  const channels: CaptureChannel[] =
+    order === "external-first" ? ["external", "opencode"] : ["opencode", "external"];
+
+  if (
+    order === "opencode-first" &&
+    isOpencodeCaptureConfigured() &&
+    isExternalCaptureConfigured()
+  ) {
+    log("opencodeProvider takes precedence over memoryModel for auto-capture");
+  } else if (
+    order === "external-first" &&
+    isOpencodeCaptureConfigured() &&
+    isExternalCaptureConfigured()
+  ) {
+    log("external API takes precedence over opencodeProvider for auto-capture");
+  }
+
+  let lastError: unknown;
+
+  for (let i = 0; i < channels.length; i++) {
+    const channel = channels[i]!;
+    if (!isChannelConfigured(channel)) continue;
+
+    try {
+      return channel === "opencode"
+        ? await tryOpencodeSummary(context, userPrompt, prompt)
+        : await tryExternalSummary(context, sessionID, userPrompt, prompt);
+    } catch (error) {
+      lastError = error;
+      const nextConfigured = channels.slice(i + 1).find((c) => isChannelConfigured(c));
+      if (!nextConfigured) break;
+
+      const fallbackLabel = nextConfigured === "external" ? "external API" : "opencode provider";
+      log(`auto-capture: ${channel} provider failed, falling back to ${fallbackLabel}`, {
+        ...serializeError(error),
+      });
+      showFallbackToast(ctx, channel, error);
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error("No auto-capture provider configured");
 }

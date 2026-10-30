@@ -1,0 +1,196 @@
+{
+  "success": true,
+  "data": {
+    "total": 14,
+    "byScope": { "user": 5, "project": 9 },
+    "byType": { "context": 8, "fact": 3, "preference": 3 },
+    "generatedAt": "2026-10-18T09:41:12.000Z",
+    "shards": [
+      {
+        "shardId": 41,
+        "scope": "project",
+        "scopeHash": "b1c2d3e4f5a6b7c8",
+        "shardIndex": 0,
+        "fileName": "project_b1c2d3e4f5a6b7c8_shard_0.db",
+        "fileExists": true,
+        "isActive": true,
+        "registeredVectorCount": 8,
+        "memoryCount": 7,
+        "oldestCreatedAt": "2026-05-02T08:15:00.000Z",
+        "newestCreatedAt": "2026-10-18T07:02:44.000Z",
+        "duplicateTagCount": 2
+      },
+      {
+        "shardId": 42,
+        "scope": "project",
+        "scopeHash": "b1c2d3e4f5a6b7c8",
+        "shardIndex": 1,
+        "fileName": "project_b1c2d3e4f5a6b7c8_shard_1.db",
+        "fileExists": true,
+        "isActive": false,
+        "registeredVectorCount": 2,
+        "memoryCount": 2,
+        "oldestCreatedAt": "2026-06-11T19:30:00.000Z",
+        "newestCreatedAt": "2026-08-29T14:11:09.000Z",
+        "duplicateTagCount": 0
+      },
+      {
+        "shardId": 7,
+        "scope": "user",
+        "scopeHash": "a9f8e7d6c5b4a3f2",
+        "shardIndex": 0,
+        "fileName": "user_a9f8e7d6c5b4a3f2_shard_0.db",
+        "fileExists": true,
+        "isActive": true,
+        "registeredVectorCount": 5,
+        "memoryCount": 5,
+        "oldestCreatedAt": "2026-04-18T11:00:00.000Z",
+        "newestCreatedAt": "2026-10-18T05:47:21.000Z",
+        "duplicateTagCount": 1
+      },
+      {
+        "shardId": 55,
+        "scope": "project",
+        "scopeHash": "0d1e2f3a4b5c6d7e",
+        "shardIndex": 0,
+        "fileName": "project_0d1e2f3a4b5c6d7e_shard_0.db",
+        "fileExists": false,
+        "isActive": true,
+        "registeredVectorCount": 3,
+        "memoryCount": 0,
+        "oldestCreatedAt": null,
+        "newestCreatedAt": null,
+        "duplicateTagCount": 0,
+        "error": "Shard DB file missing: project_0d1e2f3a4b5c6d7e_shard_0.db"
+      }
+    ],
+    "profile": {
+      "exists": true,
+      "version": 23,
+      "counts": { "preferences": 9, "patterns": 14, "workflows": 3 },
+      "lastAnalyzedAt": "2026-10-17T22:10:05.000Z",
+      "totalPromptsAnalyzed": 1290
+    },
+    "daily": [
+      {
+        "date": "2026-10-05",
+        "captures": 9,
+        "captureSkipped": 2,
+        "profileInjections": 12,
+        "compactionInjections": 1,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-06",
+        "captures": 14,
+        "captureSkipped": 3,
+        "profileInjections": 18,
+        "compactionInjections": 0,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-07",
+        "captures": 11,
+        "captureSkipped": 1,
+        "profileInjections": 15,
+        "compactionInjections": 2,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-08",
+        "captures": 16,
+        "captureSkipped": 4,
+        "profileInjections": 21,
+        "compactionInjections": 0,
+        "errors": { "listMemories": 2 }
+      },
+      {
+        "date": "2026-10-09",
+        "captures": 8,
+        "captureSkipped": 2,
+        "profileInjections": 10,
+        "compactionInjections": 1,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-10",
+        "captures": 12,
+        "captureSkipped": 0,
+        "profileInjections": 16,
+        "compactionInjections": 0,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-11",
+        "captures": 10,
+        "captureSkipped": 5,
+        "profileInjections": 13,
+        "compactionInjections": 3,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-12",
+        "captures": 15,
+        "captureSkipped": 2,
+        "profileInjections": 19,
+        "compactionInjections": 1,
+        "errors": {}
+      },
+      {
+        "date": "2026-10-13",
+        "captures": 6,
+        "captureSkipped": 9,
+        "profileInjections": 8,
+        "compactionInjections": 0,
+        "errors": {
+          "Failed to load skills for OpenCode registration": 61,
+          "Turso ready gate failed": 2
+        }
+      },
+      {
+        "date": "2026-10-14",
+        "captures": 4,
+        "captureSkipped": 11,
+        "profileInjections": 7,
+        "compactionInjections": 0,
+        "errors": { "Failed to load skills for OpenCode registration": 74 }
+      },
+      {
+        "date": "2026-10-15",
+        "captures": 7,
+        "captureSkipped": 8,
+        "profileInjections": 9,
+        "compactionInjections": 1,
+        "errors": { "Failed to load skills for OpenCode registration": 58 }
+      },
+      {
+        "date": "2026-10-16",
+        "captures": 5,
+        "captureSkipped": 10,
+        "profileInjections": 6,
+        "compactionInjections": 0,
+        "errors": {
+          "Failed to load skills for OpenCode registration": 49,
+          "Turso ready gate failed": 12,
+          "listMemories": 9
+        }
+      },
+      {
+        "date": "2026-10-17",
+        "captures": 13,
+        "captureSkipped": 3,
+        "profileInjections": 17,
+        "compactionInjections": 2,
+        "errors": { "listMemories": 1 }
+      },
+      {
+        "date": "2026-10-18",
+        "captures": 10,
+        "captureSkipped": 1,
+        "profileInjections": 11,
+        "compactionInjections": 0,
+        "errors": {}
+      }
+    ]
+  }
+}

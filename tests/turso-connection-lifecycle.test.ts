@@ -46,4 +46,22 @@ describe("turso connection lifecycle", () => {
       await reopened.get(`SELECT name FROM sqlite_master WHERE name = 'lifecycle_probe'`)
     ).toBeTruthy();
   });
+
+  it("UserPromptManager reopens after closeConnection without lifecycle reset (#443)", async () => {
+    baseDir = mkdtempSync(join(tmpdir(), "turso-lifecycle-stale-"));
+    const { CONFIG } = await import("../src/config.js");
+    CONFIG.storagePath = baseDir;
+
+    const { userPromptManager } =
+      await import("../src/services/user-prompt/user-prompt-manager.js");
+    const { tursoConnectionManager } = await import("../src/services/turso/connection-manager.js");
+
+    const id = await userPromptManager.savePrompt("sess-2", "msg-2", "/tmp/project", "stale-guard");
+    expect((await userPromptManager.getPromptById(id))?.content).toBe("stale-guard");
+
+    await tursoConnectionManager.closeConnection(join(baseDir, "user-prompts.db"));
+
+    const prompt = await userPromptManager.getPromptById(id);
+    expect(prompt?.content).toBe("stale-guard");
+  });
 });

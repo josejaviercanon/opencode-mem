@@ -366,6 +366,8 @@ async function callViaOpencodeWithClient(
           providerID: CONFIG.opencodeProvider || "bs-aigw",
           modelID: CONFIG.opencodeModel || "deepseek-v4-flash",
         },
+        // V1 prompt body: variant is a sibling of `model`, not inside it.
+        ...(CONFIG.opencodeVariant ? { variant: CONFIG.opencodeVariant } : {}),
         system: systemPrompt,
         parts: [{ type: "text", text: prompt }],
         // `noReply` suppresses assistant generation; cleanup needs the JSON reply (#177).

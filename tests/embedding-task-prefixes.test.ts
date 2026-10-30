@@ -1,5 +1,43 @@
 import { describe, it, expect } from "bun:test";
-import { applyEmbeddingTaskPrefix } from "../src/services/embedding.js";
+import { applyEmbeddingTaskPrefix, resolveEmbeddingTaskPrefix } from "../src/services/embedding.js";
+
+describe("resolveEmbeddingTaskPrefix", () => {
+  it("returns empty when prefixes are disabled and no custom prefix is set", () => {
+    expect(resolveEmbeddingTaskPrefix("document", { useTaskPrefixes: false })).toBe("");
+    expect(resolveEmbeddingTaskPrefix("query", { useTaskPrefixes: false })).toBe("");
+  });
+
+  it("returns Nomic prefixes when useTaskPrefixes is true", () => {
+    expect(resolveEmbeddingTaskPrefix("document", { useTaskPrefixes: true })).toBe(
+      "search_document: "
+    );
+    expect(resolveEmbeddingTaskPrefix("query", { useTaskPrefixes: true })).toBe("search_query: ");
+  });
+
+  it("prefers custom prefixes over Nomic", () => {
+    expect(
+      resolveEmbeddingTaskPrefix("query", {
+        useTaskPrefixes: true,
+        queryPrefix: "query: ",
+      })
+    ).toBe("query: ");
+    expect(
+      resolveEmbeddingTaskPrefix("document", {
+        useTaskPrefixes: true,
+        documentPrefix: "passage: ",
+      })
+    ).toBe("passage: ");
+  });
+
+  it("treats an explicit empty custom prefix as no prefix", () => {
+    expect(
+      resolveEmbeddingTaskPrefix("query", {
+        useTaskPrefixes: true,
+        queryPrefix: "",
+      })
+    ).toBe("");
+  });
+});
 
 describe("applyEmbeddingTaskPrefix", () => {
   it("returns text unchanged when prefixes are disabled", () => {
@@ -37,5 +75,43 @@ describe("applyEmbeddingTaskPrefix", () => {
     expect(applyEmbeddingTaskPrefix("search_query: hello", { task: "query" }, true)).toBe(
       "search_query: hello"
     );
+  });
+
+  it("applies custom prefixes from options object", () => {
+    expect(
+      applyEmbeddingTaskPrefix(
+        "hello",
+        { task: "query" },
+        {
+          useTaskPrefixes: false,
+          queryPrefix: "query: ",
+          documentPrefix: "passage: ",
+        }
+      )
+    ).toBe("query: hello");
+    expect(
+      applyEmbeddingTaskPrefix(
+        "hello",
+        { task: "document" },
+        {
+          useTaskPrefixes: false,
+          queryPrefix: "query: ",
+          documentPrefix: "passage: ",
+        }
+      )
+    ).toBe("passage: hello");
+  });
+
+  it("skips prefixing when custom prefix is empty even if Nomic is enabled", () => {
+    expect(
+      applyEmbeddingTaskPrefix(
+        "hello",
+        { task: "query" },
+        {
+          useTaskPrefixes: true,
+          queryPrefix: "",
+        }
+      )
+    ).toBe("hello");
   });
 });

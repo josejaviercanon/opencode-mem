@@ -120,7 +120,7 @@ mock.module(${JSON.stringify(configUrl)}, () => ({
   },
 }));
 
-mock.module(${JSON.stringify(loggerUrl)}, () => ({ log: () => {} }));
+mock.module(${JSON.stringify(loggerUrl)}, () => ({ log: () => {}, safeLog: () => {}, serializeError: (error) => ({ error: error instanceof Error ? error.message : String(error) }) }));
 
 mock.module(${JSON.stringify(opencodeProviderLoaderUrl)}, () => ({
   loadOpencodeProvider: async () => ({

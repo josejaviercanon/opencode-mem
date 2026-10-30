@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import {
   copyFileSync,
   existsSync,
   mkdtempSync,
   readdirSync,
-  renameSync,
+  readFileSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -28,6 +29,8 @@ describe("turso re-embed migration safety", () => {
     const { CONFIG } = await import("../src/config.js");
     CONFIG.storagePath = baseDir;
     CONFIG.embeddingDimensions = 2;
+    CONFIG.databaseEncryptionEnabled = false;
+    CONFIG.databaseEncryptionKey = undefined;
 
     const { tursoShardManager } = await import("../src/services/turso/shard-manager.js");
     const { tursoConnectionManager } = await import("../src/services/turso/connection-manager.js");
@@ -130,6 +133,92 @@ describe("turso re-embed migration safety", () => {
     expect(Number(metadata?.value)).toBe(2);
   });
 
+  for (const loseLock of [false, true]) {
+    it(`heartbeats re-embed progress (ownership lost: ${loseLock})`, async () => {
+      const shard = await createSourceShard();
+      await stubEmbedding();
+      const { CONFIG } = await import("../src/config.js");
+      CONFIG.embeddingDimensions = 4;
+      const { TURSO_LOCK_STALE_MS } = await import("../src/services/turso/operation-lock.js");
+      const oldTimestamp = new Date(Date.now() - TURSO_LOCK_STALE_MS - 60_000).toISOString();
+      const lockPath = join(baseDir, ".turso-operation.lock");
+      const { migrationService } = await import("../src/services/migration-service.js");
+      const result = await migrationService.migrateToNewModel("re-embed", (progress) => {
+        if (progress.phase !== "re-embedding") return;
+        if (progress.processed === 1) {
+          const lock = JSON.parse(readFileSync(lockPath, "utf-8"));
+          writeFileSync(
+            lockPath,
+            JSON.stringify({
+              ...lock,
+              id: loseLock ? "foreign-acquisition" : lock.id,
+              pid: loseLock ? 2147483647 : process.pid,
+              timestamp: oldTimestamp,
+            })
+          );
+        } else if (progress.processed === 2) {
+          const lock = JSON.parse(readFileSync(lockPath, "utf-8"));
+          expect(Date.parse(lock.timestamp)).toBeGreaterThan(Date.parse(oldTimestamp));
+        }
+      });
+      expect(result.success).toBe(!loseLock);
+      if (loseLock) {
+        expect(result.error).toContain("ownership lost");
+        expect(JSON.parse(readFileSync(lockPath, "utf-8")).pid).toBe(2147483647);
+        const { tursoConnectionManager } =
+          await import("../src/services/turso/connection-manager.js");
+        const db = await tursoConnectionManager.getConnection(shard.dbPath);
+        const row = await db.get("SELECT vector_extract(vector) AS vector FROM memories LIMIT 1");
+        expect(JSON.parse(String(row?.vector))).toHaveLength(2);
+      }
+    });
+  }
+
+  it("preserves a successor re-embed journal after ownership loss", async () => {
+    const shard = await createSourceShard();
+    await stubEmbedding();
+    const { CONFIG } = await import("../src/config.js");
+    CONFIG.embeddingDimensions = 4;
+    const { TURSO_LOCK_STALE_MS } = await import("../src/services/turso/operation-lock.js");
+    const lockPath = join(baseDir, ".turso-operation.lock");
+    const statePath = `${shard.dbPath}.reembed-swap.json`;
+    const successorJournal = {
+      dbPath: shard.dbPath,
+      stagedPath: `${shard.dbPath}.reembed-successor.tmp`,
+      backupPath: `${shard.dbPath}.pre-reembed-successor.bak`,
+      owner: "successor",
+    };
+    const originalWrite = fs.writeFileSync;
+    const write = spyOn(fs, "writeFileSync").mockImplementation(((
+      ...args: Parameters<typeof originalWrite>
+    ) => {
+      originalWrite(...args);
+      const target = String(args[0]);
+      if (!target.endsWith(".reembed-swap.json")) return;
+      originalWrite(statePath, JSON.stringify(successorJournal), "utf-8");
+      const lock = JSON.parse(readFileSync(lockPath, "utf-8"));
+      originalWrite(
+        lockPath,
+        JSON.stringify({
+          ...lock,
+          id: "foreign-acquisition",
+          pid: 2147483647,
+          timestamp: new Date(Date.now() - TURSO_LOCK_STALE_MS - 60_000).toISOString(),
+        })
+      );
+    }) as typeof originalWrite);
+
+    try {
+      const { migrationService } = await import("../src/services/migration-service.js");
+      const result = await migrationService.migrateToNewModel("re-embed");
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("ownership lost");
+      expect(JSON.parse(readFileSync(statePath, "utf-8"))).toEqual(successorJournal);
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it("archives source shards instead of deleting them during fresh start", async () => {
     const shard = await createSourceShard();
     const { CONFIG } = await import("../src/config.js");
@@ -158,8 +247,15 @@ describe("turso re-embed migration safety", () => {
     const stagedPath = `${shard.dbPath}.reembed-crash.tmp`;
     const backupPath = `${shard.dbPath}.pre-reembed-crash.bak`;
     const statePath = `${shard.dbPath}.reembed-swap.json`;
+    const { renameSqliteDatabase } = await import("../src/services/turso/sqlite-handle-release.js");
+    // Duplicate current DB as staged replacement, then move original to backup.
     copyFileSync(shard.dbPath, stagedPath);
-    renameSync(shard.dbPath, backupPath);
+    for (const suffix of ["-wal", "-shm"]) {
+      if (existsSync(`${shard.dbPath}${suffix}`)) {
+        copyFileSync(`${shard.dbPath}${suffix}`, `${stagedPath}${suffix}`);
+      }
+    }
+    renameSqliteDatabase(shard.dbPath, backupPath);
     writeFileSync(
       statePath,
       JSON.stringify({ dbPath: shard.dbPath, stagedPath, backupPath }),

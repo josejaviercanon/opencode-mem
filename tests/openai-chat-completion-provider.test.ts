@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { OpenAIChatCompletionProvider } from "../src/services/ai/providers/openai-chat-completion.js";
+import {
+  OpenAIChatCompletionProvider,
+  isStreamRequiredError,
+  parseChatCompletionStream,
+} from "../src/services/ai/providers/openai-chat-completion.js";
 import type { AIMessage } from "../src/services/ai/session/session-types.js";
 import type { ChatCompletionTool } from "../src/services/ai/tools/tool-schema.js";
 
@@ -255,7 +259,7 @@ describe("OpenAIChatCompletionProvider", () => {
     expect(capturedBody?.model).toBe("gpt-4o-mini");
     expect(Array.isArray(capturedBody?.messages)).toBe(true);
     expect(Array.isArray(capturedBody?.tools)).toBe(true);
-    expect(capturedBody?.tool_choice).toBe("auto");
+    expect(capturedBody?.tool_choice).toBe("required");
   });
 
   it("includes temperature 0.3 by default", async () => {
@@ -320,6 +324,25 @@ describe("OpenAIChatCompletionProvider", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("memoryTemperature");
+  });
+
+  it("returns friendly message when thinking mode rejects tool_choice required", async () => {
+    globalThis.fetch = makeFetch({
+      ok: false,
+      status: 400,
+      body: "Thinking mode does not support this tool_choice",
+    });
+
+    const result = await makeProvider({ apiUrl: "https://api.openai.com/v1" }).executeToolCall(
+      "system",
+      "user",
+      toolSchema,
+      "session-id"
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("forceToolChoice");
+    expect(result.error).toContain("false");
   });
 
   it("returns success: false when response has no choices", async () => {
@@ -393,6 +416,91 @@ describe("OpenAIChatCompletionProvider", () => {
     expect(result.iterations).toBe(1);
   });
 
+  it("retries after tool-argument validation failure and succeeds on next attempt", async () => {
+    const invalidArguments = JSON.stringify({
+      preferences: [],
+      patterns: [],
+      workflows: "none",
+    });
+    const validArguments = JSON.stringify({
+      preferences: [],
+      patterns: [],
+      workflows: [],
+      codingStyle: {},
+      domainKnowledge: [],
+    });
+
+    const responses = [
+      {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: { name: "save_memories", arguments: invalidArguments },
+                },
+              ],
+            },
+          },
+        ],
+      },
+      {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  id: "call-2",
+                  type: "function",
+                  function: { name: "save_memories", arguments: validArguments },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+
+    let callCount = 0;
+    const requestBodies: Array<{ messages?: Array<{ role?: string; content?: string }> }> = [];
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      requestBodies.push(body);
+      const responseBody = responses[callCount] ?? responses[responses.length - 1];
+      callCount++;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => JSON.stringify(responseBody),
+        json: async () => responseBody,
+      } as Response;
+    }) as typeof fetch;
+
+    const result = await makeProvider({
+      maxIterations: 3,
+      apiUrl: "https://api.openai.com/v1",
+    }).executeToolCall("system", "user", toolSchema, "session-id");
+
+    expect(result.success).toBe(true);
+    expect(result.iterations).toBe(2);
+    expect(callCount).toBe(2);
+
+    const secondMessages = requestBodies[1]?.messages ?? [];
+    const retryFeedback = secondMessages.some(
+      (msg) =>
+        typeof msg.content === "string" &&
+        (msg.content.includes("Validation failed") ||
+          msg.content.includes("workflows must be an array"))
+    );
+    expect(retryFeedback).toBe(true);
+  });
+
   it("returns success: false after max iterations with no tool call", async () => {
     globalThis.fetch = makeFetch({
       ok: true,
@@ -438,5 +546,214 @@ describe("OpenAIChatCompletionProvider", () => {
     }).executeToolCall("system", "user", toolSchema, "session-id");
 
     expect(result.success).toBe(false);
+  });
+
+  it("defaults to tool_choice=required so models cannot answer with prose", async () => {
+    let sentBody: any;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body));
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call-1",
+                    type: "function",
+                    function: { name: "save_memories", arguments: "{}" },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    await makeProvider({ apiUrl: "https://api.openai.com/v1" }).executeToolCall(
+      "system",
+      "user",
+      toolSchema,
+      "session-id"
+    );
+
+    expect(sentBody.tool_choice).toBe("required");
+  });
+
+  it("honors forceToolChoice=false to fall back to tool_choice=auto", async () => {
+    let sentBody: any;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body));
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call-1",
+                    type: "function",
+                    function: { name: "save_memories", arguments: "{}" },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    await makeProvider({
+      apiUrl: "https://api.openai.com/v1",
+      forceToolChoice: false,
+    }).executeToolCall("system", "user", toolSchema, "session-id");
+
+    expect(sentBody.tool_choice).toBe("auto");
+  });
+
+  it("detects non-stream-required API errors", () => {
+    expect(isStreamRequiredError(400, "Non-stream chat request is currently not supported")).toBe(
+      true
+    );
+    expect(isStreamRequiredError(400, "endpoint only supports streaming")).toBe(true);
+    expect(isStreamRequiredError(400, "unsupported_value temperature")).toBe(false);
+    expect(isStreamRequiredError(401, "Non-stream chat request is currently not supported")).toBe(
+      false
+    );
+  });
+
+  it("parses SSE tool-call deltas into a non-streaming response shape", async () => {
+    const validArguments = JSON.stringify({
+      preferences: [],
+      patterns: [],
+      workflows: [],
+      codingStyle: {},
+      domainKnowledge: [],
+    });
+    const sse = [
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call-1",
+                  type: "function",
+                  function: { name: "save_memories", arguments: "" },
+                },
+              ],
+            },
+          },
+        ],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [{ index: 0, function: { arguments: validArguments.slice(0, 20) } }],
+            },
+          },
+        ],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [{ index: 0, function: { arguments: validArguments.slice(20) } }],
+            },
+          },
+        ],
+      })}`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}`,
+      "data: [DONE]",
+    ].join("\n");
+
+    const parsed = (await parseChatCompletionStream({
+      text: async () => sse,
+    } as Response)) as {
+      choices: Array<{ message: { tool_calls?: Array<{ function: { arguments: string } }> } }>;
+    };
+
+    expect(parsed.choices[0]?.message.tool_calls?.[0]?.function.arguments).toBe(validArguments);
+  });
+
+  it("retries with stream:true when non-streaming chat is rejected", async () => {
+    const validArguments = JSON.stringify({
+      preferences: [],
+      patterns: [],
+      workflows: [],
+      codingStyle: {},
+      domainKnowledge: [],
+    });
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const sse = [
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call-1",
+                  type: "function",
+                  function: { name: "save_memories", arguments: validArguments },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      })}`,
+      "data: [DONE]",
+    ].join("\n");
+
+    let callCount = 0;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      requestBodies.push(body);
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: false,
+          status: 400,
+          statusText: "Bad Request",
+          text: async () => "Non-stream chat request is currently not supported",
+          json: async () => ({}),
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => sse,
+        json: async () => {
+          throw new Error("streaming response has no JSON body");
+        },
+      } as Response;
+    }) as typeof fetch;
+
+    const result = await makeProvider({ apiUrl: "https://api.example.com/v1" }).executeToolCall(
+      "system",
+      "user",
+      toolSchema,
+      "session-id"
+    );
+
+    expect(result.success).toBe(true);
+    expect(callCount).toBe(2);
+    expect(requestBodies[0]?.stream).toBeUndefined();
+    expect(requestBodies[1]?.stream).toBe(true);
   });
 });

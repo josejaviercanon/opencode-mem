@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   buildBoundedSummaryPrompt,
   buildMarkdownContext,
+  extractAIContent,
   getAutoCaptureMarkdownBudget,
 } from "../src/services/auto-capture.js";
 import { utf8ByteLength } from "../src/utils/context-limit.js";
@@ -94,5 +95,56 @@ describe("buildMarkdownContext budgeting (#232)", () => {
     expect(markdownBudget).toBeLessThan(totalBudget);
     expect(utf8ByteLength(userPrompt)).toBeLessThan(totalBudget);
     expect(userPrompt).toContain("truncated to autoCaptureMaxContextBytes");
+  });
+});
+
+describe("extractAIContent tool calls", () => {
+  it("extracts tool names from v2-shaped parts", () => {
+    const { toolCalls } = extractAIContent([
+      {
+        info: { role: "assistant" },
+        parts: [
+          {
+            type: "tool",
+            id: "t1",
+            name: "bash",
+            state: { status: "completed", input: { command: "ls" } },
+          },
+        ],
+      },
+    ]);
+
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]?.name).toBe("bash");
+    expect(toolCalls[0]?.input).toContain('command: "ls"');
+  });
+
+  it("keeps extracting tool names from v1-shaped parts", () => {
+    const { toolCalls } = extractAIContent([
+      {
+        info: { role: "assistant" },
+        parts: [
+          {
+            type: "tool",
+            callID: "call_1",
+            tool: "read",
+            state: { input: { path: "/tmp/x" } },
+          },
+        ],
+      },
+    ]);
+
+    expect(toolCalls[0]?.name).toBe("read");
+  });
+
+  it("falls back to unknown when a tool part has no name", () => {
+    const { toolCalls } = extractAIContent([
+      {
+        info: { role: "assistant" },
+        parts: [{ type: "tool", state: { input: {} } }],
+      },
+    ]);
+
+    expect(toolCalls[0]?.name).toBe("unknown");
   });
 });

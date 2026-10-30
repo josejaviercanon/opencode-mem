@@ -20,7 +20,10 @@ import { extractScopeFromContainerTag } from "./memory-scope.js";
 import { getProjectTagInfo } from "./tags.js";
 import { embeddingService } from "./embedding.js";
 import { ensureTursoReady } from "./turso/ready.js";
-import { acquireTursoOperationLock } from "./turso/operation-lock.js";
+import {
+  acquireTursoOperationLock,
+  isTursoLockOwnershipLostError,
+} from "./turso/operation-lock.js";
 import { tursoShardManager } from "./turso/shard-manager.js";
 import { tursoConnectionManager } from "./turso/connection-manager.js";
 import { tursoVectorSearch } from "./turso/vector-search.js";
@@ -334,6 +337,7 @@ export class MemoryPortabilityService {
           },
           isPinned: Boolean(memory.isPinned),
         });
+        releaseLock.heartbeat();
       }
 
       // Phase B: single transactional write. Avoid getWriteShard() here because it
@@ -355,6 +359,7 @@ export class MemoryPortabilityService {
               });
             }
             insertedIds.push(item.record.id);
+            releaseLock.heartbeat();
           }
         });
 
@@ -362,12 +367,40 @@ export class MemoryPortabilityService {
           shard.id,
           await tursoVectorSearch.countAllVectors(db)
         );
+        releaseLock.heartbeat();
       });
 
       log("Memory import completed", {
         imported: insertedIds.length,
         containerTag: target.tag,
       });
+
+      try {
+        const { isMarkdownBackend, writeMemoryMarkdownFile } =
+          await import("./markdown/backend.js");
+        if (isMarkdownBackend()) {
+          for (const item of prepared) {
+            writeMemoryMarkdownFile({
+              id: item.record.id,
+              content: item.record.content,
+              type: item.record.type,
+              tags: item.record.tags
+                ? item.record.tags
+                    .split(",")
+                    .map((t) => t.trim())
+                    .filter(Boolean)
+                : undefined,
+              containerTag: item.record.containerTag,
+              createdAt: item.record.createdAt,
+              updatedAt: item.record.updatedAt,
+              source: "import",
+              title: item.record.displayName,
+            });
+          }
+        }
+      } catch (mdError) {
+        log("Memory import markdown write-through failed", { error: String(mdError) });
+      }
 
       return {
         success: true,
@@ -378,8 +411,11 @@ export class MemoryPortabilityService {
         containerTag: target.tag,
       };
     } catch (error) {
-      // Best-effort cleanup if a partial insert somehow escaped the transaction.
-      if (insertedIds.length > 0) {
+      // Best-effort cleanup for ordinary failures only. Ownership loss rolls back
+      // an open transaction, but a successor may already have committed these IDs
+      // (or our transaction may have committed before the final heartbeat).
+      // Never compensate shared rows without current ownership.
+      if (!isTursoLockOwnershipLostError(error) && insertedIds.length > 0) {
         try {
           const shards = await tursoShardManager.getAllShards(scope, hash);
           for (const shard of shards) {

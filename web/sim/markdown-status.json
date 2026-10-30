@@ -1,0 +1,47 @@
+{
+  "enabled": true,
+  "path": "~/Documents/LLM-Wiki (sim)",
+  "fileCount": 5,
+  "lastReconcileAt": 1761570000000,
+  "watcherActive": true,
+  "files": [
+    {
+      "id": "mem_pin_architecture",
+      "relPath": "mem_pin_architecture.md",
+      "title": "Architecture decision",
+      "mtimeMs": 1761566400000,
+      "source": "auto-capture",
+      "containerTag": "opencode_project_sim"
+    },
+    {
+      "id": "mem_feature_toast",
+      "relPath": "mem_feature_toast.md",
+      "title": "Toast notifications",
+      "mtimeMs": 1761562800000,
+      "source": "manual",
+      "containerTag": "opencode_project_sim"
+    },
+    {
+      "id": "md_sim_raneto_page",
+      "relPath": "wiki/Raneto-style-page.md",
+      "title": "Raneto-style page",
+      "mtimeMs": 1761559200000,
+      "source": "markdown-import"
+    },
+    {
+      "id": "md_sim_plain_note",
+      "relPath": "notes/plain-note.md",
+      "title": "plain-note",
+      "mtimeMs": 1761555600000,
+      "source": "markdown-import"
+    },
+    {
+      "id": "mem_docs_i18n",
+      "relPath": "docs/i18n-guidelines.md",
+      "title": "i18n guidelines",
+      "mtimeMs": 1761552000000,
+      "source": "manual",
+      "containerTag": "opencode_project_sim"
+    }
+  ]
+}

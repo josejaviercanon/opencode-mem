@@ -44,11 +44,50 @@ export const STRUCTURED_OUTPUT_AGENT = "opencode-mem-structured";
 /** Hard ceiling for a single internal structured-output prompt. */
 export const STRUCTURED_OUTPUT_TIMEOUT_MS = 90_000;
 
-let _structuredOutputTimeoutMs = STRUCTURED_OUTPUT_TIMEOUT_MS;
+/**
+ * Soft agent step budget. OpenCode only injects a last-step warning for
+ * `format: json_schema` and can keep looping when forced tool calls fail
+ * (seen with opencode-claude-auth in #278). We also abort client-side after
+ * this many `step-start` parts.
+ */
+export const STRUCTURED_OUTPUT_MAX_STEPS = 2;
 
-/** Test helper: override the structured-output prompt timeout. Pass undefined to reset. */
+/** Cap OpenCode schema retries so a bad provider cannot spin forever. */
+export const STRUCTURED_OUTPUT_DEFAULT_RETRY_COUNT = 1;
+
+let _structuredOutputTimeoutOverrideMs: number | undefined;
+// Configured timeout (CONFIG.opencodeTimeoutMs), injected by the plugin init
+// instead of importing config.js here: the provider module is bundled into a
+// single-file lazy loader whose import graph must stay free of config side
+// effects (config creation banner, DATA_DIR mkdir) for subprocess gates.
+let _structuredOutputConfiguredMs: number | undefined;
+
+/**
+ * Test helper: override the structured-output prompt timeout. Pass undefined
+ * to reset to the configured value.
+ */
 export function setStructuredOutputTimeoutMsForTests(ms: number | undefined): void {
-  _structuredOutputTimeoutMs = ms ?? STRUCTURED_OUTPUT_TIMEOUT_MS;
+  _structuredOutputTimeoutOverrideMs = ms;
+}
+
+/**
+ * Inject the configured structured-output timeout (CONFIG.opencodeTimeoutMs,
+ * already normalized/clamped in config.ts). Called once by the plugin init.
+ */
+export function setStructuredOutputTimeoutConfig(ms: number): void {
+  _structuredOutputConfiguredMs = ms;
+}
+
+/**
+ * Effective structured-output prompt timeout: the test override wins, then
+ * the configured value, then the hard-coded default.
+ */
+function effectiveStructuredOutputTimeoutMs(): number {
+  return (
+    _structuredOutputTimeoutOverrideMs ??
+    _structuredOutputConfiguredMs ??
+    STRUCTURED_OUTPUT_TIMEOUT_MS
+  );
 }
 
 export const STRUCTURED_OUTPUT_PERMISSIONS = [
@@ -69,12 +108,17 @@ export const STRUCTURED_OUTPUT_METADATA = {
 };
 
 const _internalSessions = new Set<string>();
+const _structuredStepCounts = new Map<string, number>();
+const _structuredStepAbortErrors = new Map<string, Error>();
 
 let _connectedProviders: Set<string> = new Set();
 let _v2Client: OpencodeClient | undefined;
 let _v2BaseUrl: string | undefined;
 let _hostFetch: typeof fetch | undefined;
 let _useSdkTransport = false;
+// Registered by the plugin init so a gate miss can force one provider-directory
+// refresh before failing (late host provider registration).
+let _connectedProvidersRefresher: (() => Promise<void>) | undefined;
 
 export function setHostFetch(customFetch: typeof fetch): void {
   _hostFetch = customFetch;
@@ -92,8 +136,41 @@ export function isProviderConnected(providerName: string): boolean {
   return _connectedProviders.has(providerName);
 }
 
+/** Register (or clear) the refresh callback used by ensureProviderConnected. */
+export function setConnectedProvidersRefresher(refresher?: () => Promise<void>): void {
+  _connectedProvidersRefresher = refresher;
+}
+
+/** Clear the refresh callback only if it is still the one being disposed. */
+export function clearConnectedProvidersRefresher(refresher: () => Promise<void>): void {
+  if (_connectedProvidersRefresher === refresher) _connectedProvidersRefresher = undefined;
+}
+
+/**
+ * Refresh-on-miss for the connectivity gate: when a provider id is missing
+ * from the snapshot and a refresher is registered, await one refresh and
+ * re-check. Returns the re-checked connectivity; never refreshes twice for
+ * the same call and never throws (refresh errors are logged by the refresher).
+ */
+export async function ensureProviderConnected(providerName: string): Promise<boolean> {
+  if (_connectedProviders.has(providerName)) return true;
+  const refresher = _connectedProvidersRefresher;
+  if (!refresher) return false;
+  try {
+    await refresher();
+  } catch {
+    // The refresher logs; a failed refresh keeps the previous set.
+  }
+  return _connectedProviders.has(providerName);
+}
+
 export function setV2Client(client: OpencodeClient): void {
   _v2Client = client;
+  // Native v2 adapters pass a session-capable client without a server URL.
+  // Enable the SDK transport path so structured output does not require createV2Client.
+  if (hasV2SessionClient(client)) {
+    _useSdkTransport = true;
+  }
 }
 
 export function getV2Client(): OpencodeClient | undefined {
@@ -116,14 +193,69 @@ export function isInternalStructuredSession(sessionID: string): boolean {
 /** Test helper: clear tracked internal session IDs. */
 export function resetInternalStructuredSessions(): void {
   _internalSessions.clear();
+  _structuredStepCounts.clear();
+  _structuredStepAbortErrors.clear();
 }
 
 function markInternalSession(sessionID: string): void {
   _internalSessions.add(sessionID);
+  _structuredStepCounts.set(sessionID, 0);
+  _structuredStepAbortErrors.delete(sessionID);
 }
 
 function unmarkInternalSession(sessionID: string): void {
   _internalSessions.delete(sessionID);
+  _structuredStepCounts.delete(sessionID);
+}
+
+/**
+ * Record a `step-start` on an internal structured-output session.
+ * Returns whether the client should abort (step budget exceeded).
+ */
+export function noteStructuredOutputStep(sessionID: string): {
+  tracked: boolean;
+  steps: number;
+  shouldAbort: boolean;
+} {
+  if (!_internalSessions.has(sessionID)) {
+    return { tracked: false, steps: 0, shouldAbort: false };
+  }
+  const steps = (_structuredStepCounts.get(sessionID) ?? 0) + 1;
+  _structuredStepCounts.set(sessionID, steps);
+  if (steps <= STRUCTURED_OUTPUT_MAX_STEPS) {
+    return { tracked: true, steps, shouldAbort: false };
+  }
+  _structuredStepAbortErrors.set(
+    sessionID,
+    new Error(
+      `opencode-mem: structured-output aborted after ${steps} steps ` +
+        `(agent maxSteps=${STRUCTURED_OUTPUT_MAX_STEPS} may be ignored while format:json_schema forces tool calls; ` +
+        `try a model that supports OpenCode structured output, or configure memoryModel + memoryApiUrl fallback — ` +
+        `opencode-claude-auth loops are a common trigger)`
+    )
+  );
+  return { tracked: true, steps, shouldAbort: true };
+}
+
+/** Consume a step-budget abort error if the prompt failed after we aborted. */
+export function takeStructuredOutputStepAbortError(sessionID: string): Error | undefined {
+  const error = _structuredStepAbortErrors.get(sessionID);
+  _structuredStepAbortErrors.delete(sessionID);
+  return error;
+}
+
+function structuredOutputTimeoutError(timeoutMs: number): Error {
+  return new Error(
+    `opencode-mem: structured-output timed out after ${timeoutMs}ms ` +
+      `(provider may be looping on forced StructuredOutput; ` +
+      `try a known json_schema-capable model or memoryModel + memoryApiUrl fallback)`
+  );
+}
+
+function preferStepAbortError(sessionID: string, error: unknown): never {
+  const stepError = takeStructuredOutputStepAbortError(sessionID);
+  if (stepError) throw stepError;
+  throw error;
 }
 
 function sessionCreateBody(): Record<string, unknown> {
@@ -137,6 +269,7 @@ function sessionCreateBody(): Record<string, unknown> {
 function sessionPromptFields(args: {
   providerID: string;
   modelID: string;
+  variant?: string;
   systemPrompt: string;
   userPrompt: string;
   jsonSchema: Record<string, unknown>;
@@ -144,6 +277,9 @@ function sessionPromptFields(args: {
 }): Record<string, unknown> {
   return {
     model: { providerID: args.providerID, modelID: args.modelID },
+    // The V1 session prompt body carries the reasoning variant as a sibling
+    // of `model` (SessionPromptData.body.variant), not inside model.
+    ...(args.variant ? { variant: args.variant } : {}),
     agent: STRUCTURED_OUTPUT_AGENT,
     system: args.systemPrompt,
     parts: [{ type: "text", text: args.userPrompt }],
@@ -154,15 +290,86 @@ function sessionPromptFields(args: {
     format: {
       type: "json_schema",
       schema: args.jsonSchema,
-      ...(args.retryCount !== undefined ? { retryCount: args.retryCount } : {}),
+      // Bound schema retries so Claude-auth / incompatible providers fail
+      // closed instead of spinning until the 90s timeout (#278).
+      retryCount: args.retryCount ?? STRUCTURED_OUTPUT_DEFAULT_RETRY_COUNT,
     },
   };
+}
+
+/** Tools-off prompt body: plain text JSON (no format:json_schema / forced tools). */
+function sessionTextJsonPromptFields(args: {
+  providerID: string;
+  modelID: string;
+  variant?: string;
+  systemPrompt: string;
+  userPrompt: string;
+  jsonSchema: Record<string, unknown>;
+}): Record<string, unknown> {
+  const schemaText = JSON.stringify(args.jsonSchema, null, 2);
+  return {
+    model: { providerID: args.providerID, modelID: args.modelID },
+    ...(args.variant ? { variant: args.variant } : {}),
+    agent: STRUCTURED_OUTPUT_AGENT,
+    system:
+      `${args.systemPrompt}\n\n` +
+      `Respond with ONLY a single JSON value that validates against this JSON Schema. ` +
+      `No markdown fences, no commentary.\n\nJSON Schema:\n${schemaText}`,
+    parts: [{ type: "text", text: args.userPrompt }],
+    tools: { "*": false },
+    noReply: false,
+  };
+}
+
+/**
+ * Claude / opencode-claude-auth registers as provider `anthropic`. Forced
+ * `format: json_schema` often loops; prefer auth-preserving text JSON (#278).
+ */
+export function shouldUseOpencodeTextJson(providerID: string): boolean {
+  const id = providerID.trim().toLowerCase();
+  return id === "anthropic" || id.startsWith("anthropic/");
+}
+
+function extractAssistantText(parts: unknown[]): string {
+  return parts
+    .filter(
+      (part): part is { type: string; text: string } =>
+        typeof part === "object" &&
+        part !== null &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string"
+    )
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+function parseJsonFromAssistantText(rawText: string): unknown {
+  const fenced = rawText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? rawText).trim();
+  const match = candidate.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+  if (!match) {
+    throw new Error(
+      "opencode-mem: text-json fallback response did not contain valid JSON " +
+        "(opencode-claude-auth / anthropic path)"
+    );
+  }
+  try {
+    return JSON.parse(match[0]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`opencode-mem: text-json fallback JSON parse failed: ${message}`, {
+      cause: error,
+    });
+  }
 }
 
 export interface StructuredOutputOptions<T> {
   client: OpencodeClient;
   providerID: string;
   modelID: string;
+  /** Optional reasoning variant forwarded to the session prompt / Generate API. */
+  variant?: string;
   systemPrompt: string;
   userPrompt: string;
   schema: z.ZodType<T>;
@@ -170,12 +377,32 @@ export interface StructuredOutputOptions<T> {
   retryCount?: number;
 }
 
+/** Last host-reported session model from `chat.params` / the V2 context hook. */
+let rememberedSessionModel: { providerID: string; modelID: string } | undefined;
+
+/**
+ * Remember the concrete model the host is using for the current session.
+ * OpenCode v2 no longer writes `model.json`, so profile-learning and other
+ * non-prompt structured-output paths need this in-process fallback for
+ * `opencodeModel: "inherit"` (issue #453).
+ */
+export function rememberSessionModel(providerID: string, modelID: string): void {
+  if (!providerID || !modelID || modelID === "inherit") return;
+  rememberedSessionModel = { providerID, modelID };
+}
+
+/** Test helper: drop the in-process session model between cases. */
+export function clearRememberedSessionModelForTests(): void {
+  rememberedSessionModel = undefined;
+}
+
 /**
  * Resolve `opencodeModel: "inherit"` to a concrete provider/model.
  *
- * Prefer an explicit prompt-recorded model (auto-capture path). Otherwise fall
- * back to OpenCode's recent model list so profile-learning / conflict / dedup
- * paths don't send the literal model id "inherit" (ProviderModelNotFoundError).
+ * Prefer an explicit prompt-recorded model (auto-capture path). Otherwise use
+ * the last host-reported session model, then OpenCode's recent `model.json`
+ * list (v1 hosts), so profile-learning / conflict / dedup paths don't send the
+ * literal model id "inherit" (ProviderModelNotFoundError).
  */
 export function resolveOpencodeModelRef(opts: {
   providerID: string;
@@ -188,6 +415,10 @@ export function resolveOpencodeModelRef(opts: {
 
   if (opts.prompt?.providerId && opts.prompt?.modelId) {
     return { providerID: opts.prompt.providerId, modelID: opts.prompt.modelId };
+  }
+
+  if (rememberedSessionModel) {
+    return rememberedSessionModel;
   }
 
   const recent = readRecentOpencodeModel(opts.providerID);
@@ -222,17 +453,21 @@ function readRecentOpencodeModel(
 }
 
 /**
- * Generate one structured-output completion via opencode's HTTP API.
- * Throws on: session.create failure, prompt failure, AssistantMessage.error
- * (StructuredOutputError / ApiError / ...), missing `info.structured`,
- * timeout, or final Zod validation failure.
+ * Generate one structured completion via opencode's HTTP API.
+ *
+ * Prefer `format: json_schema` (forced StructuredOutput). For Anthropic /
+ * opencode-claude-auth (`providerID` anthropic), use auth-preserving text JSON
+ * instead — forced tools commonly loop until timeout (#278).
+ *
+ * Throws on: session.create failure, prompt failure, AssistantMessage.error,
+ * missing structured/text JSON, timeout, or final Zod validation failure.
  */
 export async function generateStructuredOutput<T>(opts: StructuredOutputOptions<T>): Promise<T> {
   const resolved = resolveOpencodeModelRef({
     providerID: opts.providerID,
     modelID: opts.modelID,
   });
-  const { client, systemPrompt, userPrompt, schema, directory, retryCount } = opts;
+  const { client, systemPrompt, userPrompt, schema, directory, retryCount, variant } = opts;
   const { providerID, modelID } = resolved;
 
   const jsonSchema =
@@ -242,17 +477,24 @@ export async function generateStructuredOutput<T>(opts: StructuredOutputOptions<
       }
     ).toJSONSchema?.() ?? (await import("zod")).z.toJSONSchema(schema);
 
+  const args: SdkStructuredOutputArgs<T> = {
+    providerID,
+    modelID,
+    variant,
+    systemPrompt,
+    userPrompt,
+    directory,
+    retryCount,
+    jsonSchema,
+    schema,
+  };
+
+  const useTextJson = shouldUseOpencodeTextJson(providerID);
+
   if (_useSdkTransport && hasV2SessionClient(client)) {
-    return generateViaSdkClient(client, {
-      providerID,
-      modelID,
-      systemPrompt,
-      userPrompt,
-      directory,
-      retryCount,
-      jsonSchema,
-      schema,
-    });
+    return useTextJson
+      ? generateTextJsonViaSdkClient(client, args)
+      : generateViaSdkClient(client, args);
   }
 
   const baseUrl = _v2BaseUrl;
@@ -262,51 +504,9 @@ export async function generateStructuredOutput<T>(opts: StructuredOutputOptions<
     );
   }
   const base = stripTrailingSlash(baseUrl);
-
-  const sessionID = await createSession(base, directory);
-  markInternalSession(sessionID);
-  try {
-    const info = await withStructuredOutputTimeout(
-      () =>
-        promptSession(base, {
-          sessionID,
-          directory,
-          providerID,
-          modelID,
-          systemPrompt,
-          userPrompt,
-          jsonSchema,
-          retryCount,
-        }),
-      () => abortSession(base, sessionID, directory)
-    );
-
-    if (info.error) {
-      throw new Error(
-        `opencode-mem: opencode reported ${info.error.name}: ${formatAssistantError(info.error)}`
-      );
-    }
-
-    const structuredOutput = info.structured_output ?? info.structured;
-    if (structuredOutput === undefined || structuredOutput === null) {
-      throw new Error(
-        "opencode-mem: opencode returned no structured output (info.structured_output/info.structured were empty)"
-      );
-    }
-
-    return schema.parse(structuredOutput);
-  } finally {
-    unmarkInternalSession(sessionID);
-    // Best-effort: leaving a transient session behind is cosmetic, not
-    // worth failing a successful capture if cleanup itself errors.
-    try {
-      await deleteSession(base, sessionID, directory);
-    } catch {
-      // intentionally swallowed
-    } finally {
-      untrackInternalCaptureSession(sessionID);
-    }
-  }
+  return useTextJson
+    ? generateTextJsonViaFetch(base, args)
+    : generateJsonSchemaViaFetch(base, args);
 }
 
 type V2SessionClient = {
@@ -321,6 +521,7 @@ type V2SessionClient = {
 interface SdkStructuredOutputArgs<T> {
   providerID: string;
   modelID: string;
+  variant?: string;
   systemPrompt: string;
   userPrompt: string;
   directory?: string;
@@ -338,6 +539,101 @@ function hasV2SessionClient(client: OpencodeClient): client is OpencodeClient & 
     typeof candidate.prompt === "function" &&
     typeof candidate.delete === "function"
   );
+}
+
+async function generateJsonSchemaViaFetch<T>(
+  base: string,
+  args: SdkStructuredOutputArgs<T>
+): Promise<T> {
+  const sessionID = await createSession(base, args.directory);
+  markInternalSession(sessionID);
+  try {
+    const info = await withStructuredOutputTimeout(
+      () =>
+        promptSession(base, {
+          sessionID,
+          directory: args.directory,
+          providerID: args.providerID,
+          modelID: args.modelID,
+          variant: args.variant,
+          systemPrompt: args.systemPrompt,
+          userPrompt: args.userPrompt,
+          jsonSchema: args.jsonSchema,
+          retryCount: args.retryCount,
+        }),
+      () => abortSession(base, sessionID, args.directory)
+    );
+
+    if (info.error) {
+      throw new Error(
+        `opencode-mem: opencode reported ${info.error.name}: ${formatAssistantError(info.error)}`
+      );
+    }
+
+    const structuredOutput = info.structured_output ?? info.structured;
+    if (structuredOutput === undefined || structuredOutput === null) {
+      throw new Error(
+        "opencode-mem: opencode returned no structured output (info.structured_output/info.structured were empty)"
+      );
+    }
+
+    return args.schema.parse(structuredOutput);
+  } catch (error) {
+    preferStepAbortError(sessionID, error);
+    throw error;
+  } finally {
+    unmarkInternalSession(sessionID);
+    try {
+      await deleteSession(base, sessionID, args.directory);
+    } catch {
+      // intentionally swallowed
+    } finally {
+      untrackInternalCaptureSession(sessionID);
+    }
+  }
+}
+
+async function generateTextJsonViaFetch<T>(
+  base: string,
+  args: SdkStructuredOutputArgs<T>
+): Promise<T> {
+  const sessionID = await createSession(base, args.directory);
+  markInternalSession(sessionID);
+  try {
+    const data = await withStructuredOutputTimeout(
+      () =>
+        promptSessionRaw(base, {
+          sessionID,
+          directory: args.directory,
+          body: sessionTextJsonPromptFields(args),
+        }),
+      () => abortSession(base, sessionID, args.directory)
+    );
+
+    if (!data.info) {
+      throw new Error("opencode-mem: prompt response missing `info`");
+    }
+    if (data.info.error) {
+      throw new Error(
+        `opencode-mem: opencode reported ${data.info.error.name}: ${formatAssistantError(data.info.error)}`
+      );
+    }
+
+    const rawText = extractAssistantText(Array.isArray(data.parts) ? data.parts : []);
+    return args.schema.parse(parseJsonFromAssistantText(rawText));
+  } catch (error) {
+    preferStepAbortError(sessionID, error);
+    throw error;
+  } finally {
+    unmarkInternalSession(sessionID);
+    try {
+      await deleteSession(base, sessionID, args.directory);
+    } catch {
+      // intentionally swallowed
+    } finally {
+      untrackInternalCaptureSession(sessionID);
+    }
+  }
 }
 
 async function generateViaSdkClient<T>(
@@ -389,6 +685,70 @@ async function generateViaSdkClient<T>(
       );
     }
     return args.schema.parse(structuredOutput);
+  } catch (error) {
+    preferStepAbortError(sessionID, error);
+    throw error;
+  } finally {
+    unmarkInternalSession(sessionID);
+    try {
+      await client.session.delete({
+        sessionID,
+        ...(args.directory ? { directory: args.directory } : {}),
+      });
+    } catch {
+      // Best-effort cleanup for the transient capture session.
+    } finally {
+      untrackInternalCaptureSession(sessionID);
+    }
+  }
+}
+
+async function generateTextJsonViaSdkClient<T>(
+  client: OpencodeClient & V2SessionClient,
+  args: SdkStructuredOutputArgs<T>
+): Promise<T> {
+  const createdResponse = await client.session.create({
+    ...sessionCreateBody(),
+    ...(args.directory ? { directory: args.directory } : {}),
+  });
+  const created = readSdkData<{ id?: string }>(createdResponse, "POST /session");
+  if (!created.id) {
+    throw new Error(
+      "opencode-mem: session.create returned no session id; cannot generate structured output"
+    );
+  }
+
+  const sessionID = created.id;
+  trackInternalCaptureSession(sessionID);
+  markInternalSession(sessionID);
+  try {
+    const promptResponse = await withStructuredOutputTimeout(
+      () =>
+        client.session.prompt({
+          sessionID,
+          ...(args.directory ? { directory: args.directory } : {}),
+          ...sessionTextJsonPromptFields(args),
+        }),
+      () =>
+        client.session.abort?.({
+          sessionID,
+          ...(args.directory ? { directory: args.directory } : {}),
+        })
+    );
+    const data = readSdkData<MessageV2WithParts>(promptResponse, "POST /session/{id}/message");
+    if (!data.info) {
+      throw new Error("opencode-mem: prompt response missing `info`");
+    }
+    if (data.info.error) {
+      throw new Error(
+        `opencode-mem: opencode reported ${data.info.error.name}: ${formatAssistantError(data.info.error)}`
+      );
+    }
+    const rawText = extractAssistantText(Array.isArray(data.parts) ? data.parts : []);
+    return args.schema.parse(parseJsonFromAssistantText(rawText));
+  } catch (error) {
+    preferStepAbortError(sessionID, error);
+    throw error;
   } finally {
     unmarkInternalSession(sessionID);
     try {
@@ -409,10 +769,10 @@ async function withStructuredOutputTimeout<T>(
   onTimeout: () => unknown
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutMs = _structuredOutputTimeoutMs;
+  const timeoutMs = effectiveStructuredOutputTimeoutMs();
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(new Error(`opencode-mem: structured-output timed out after ${timeoutMs}ms`));
+      reject(structuredOutputTimeoutError(timeoutMs));
     }, timeoutMs);
   });
 
@@ -497,6 +857,7 @@ interface PromptSessionArgs {
   directory?: string;
   providerID: string;
   modelID: string;
+  variant?: string;
   systemPrompt: string;
   userPrompt: string;
   jsonSchema: Record<string, unknown>;
@@ -540,20 +901,30 @@ interface MessageV2WithParts {
 }
 
 async function promptSession(base: string, args: PromptSessionArgs): Promise<AssistantInfo> {
-  const url = `${base}/session/${encodeURIComponent(args.sessionID)}/message${buildQuery(args.directory)}`;
-  const body = sessionPromptFields(args);
-  const data = await fetchJson<MessageV2WithParts>(
-    { label: "POST /session/{id}/message", url },
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }
-  );
+  const data = await promptSessionRaw(base, {
+    sessionID: args.sessionID,
+    directory: args.directory,
+    body: sessionPromptFields(args),
+  });
   if (!data.info) {
     throw new Error("opencode-mem: prompt response missing `info`");
   }
   return data.info;
+}
+
+async function promptSessionRaw(
+  base: string,
+  args: { sessionID: string; directory?: string; body: Record<string, unknown> }
+): Promise<MessageV2WithParts> {
+  const url = `${base}/session/${encodeURIComponent(args.sessionID)}/message${buildQuery(args.directory)}`;
+  return fetchJson<MessageV2WithParts>(
+    { label: "POST /session/{id}/message", url },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(args.body),
+    }
+  );
 }
 
 async function abortSession(base: string, sessionID: string, directory?: string): Promise<void> {

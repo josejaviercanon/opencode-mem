@@ -7,16 +7,18 @@ import type { AIProviderType } from "../session/session-types.js";
  * MiniMax provider.
  *
  * MiniMax exposes an Anthropic Messages-compatible endpoint for its text
- * models. The global endpoint (https://api.minimax.io) and the China endpoint
- * (https://api.minimaxi.com) both expose the same `/anthropic/v1/messages`
- * path and authenticate with the `x-api-key` header. This provider reuses the
- * Anthropic Messages request/response handling and only overrides the resolved
- * request endpoint URL and the session provider tag, so MiniMax is
- * distinguishable from Anthropic in the session store and diagnostics.
+ * models. The global endpoint (https://api.minimax.io) and the current China
+ * endpoint (https://api.minimax.cn) both expose the same
+ * `/anthropic/v1/messages` path and authenticate with the `x-api-key` header.
+ * Configured legacy China hosts such as https://api.minimaxi.com are still
+ * resolved without remapping. This provider reuses the Anthropic Messages
+ * request/response handling and only overrides the resolved request endpoint
+ * URL and the session provider tag, so MiniMax is distinguishable from
+ * Anthropic in the session store and diagnostics.
  *
  * Users configure the base URL as `memoryApiUrl`:
  *   - global endpoint: "https://api.minimax.io"
- *   - China endpoint:  "https://api.minimaxi.com"
+ *   - China endpoint:  "https://api.minimax.cn"
  */
 export class MiniMaxProvider extends AnthropicMessagesProvider {
   constructor(config: ProviderConfig, aiSessionManager: AISessionManager) {

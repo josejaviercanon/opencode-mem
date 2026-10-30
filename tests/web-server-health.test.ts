@@ -3,10 +3,12 @@ import { createServer } from "node:http";
 import { WebServer, nextFallbackPort } from "../src/services/web-server.js";
 
 describe("web server health check", () => {
-  it("authenticates the stats request when an API token is configured", async () => {
+  it("authenticates the stats probe when an API token is configured", async () => {
     const originalFetch = globalThis.fetch;
+    let requestUrl: string | undefined;
     let requestHeaders: Headers | undefined;
-    globalThis.fetch = async (_input, init) => {
+    globalThis.fetch = async (input, init) => {
+      requestUrl = String(input);
       requestHeaders = new Headers(init?.headers);
       return new Response(JSON.stringify({ success: true }), { status: 200 });
     };
@@ -20,6 +22,7 @@ describe("web server health check", () => {
       });
 
       expect(await server.checkServerAvailable()).toBe(true);
+      expect(requestUrl).toBe("http://0.0.0.0:4747/api/stats?probe=1");
       expect(requestHeaders?.get("Authorization")).toBe("Bearer health-token");
     } finally {
       globalThis.fetch = originalFetch;
@@ -53,19 +56,20 @@ describe("web server health check", () => {
   });
 
   it("becomes owner on a neighbor port after repeated failed takeovers", async () => {
-    // Simulate a Windows orphaned LISTEN socket: a real listener holds the
-    // port and answers HTTP, but every bind attempt fails with EADDRINUSE.
+    // Fixed ports below Linux's default ephemeral range (32768–60999) so a
+    // busy full-suite run cannot transiently hold the neighbor via outbound
+    // connections and flake the takeover bind (see #436).
     const occupy = createServer((_req, res) => {
       res.writeHead(200);
       res.end("occupied");
     });
-    await new Promise<void>((resolve) => occupy.listen(48747, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => occupy.listen(28747, "127.0.0.1", resolve));
 
     const originalRandom = Math.random;
     Math.random = () => 0;
 
     try {
-      const server = new WebServer({ enabled: true, host: "127.0.0.1", port: 48747 });
+      const server = new WebServer({ enabled: true, host: "127.0.0.1", port: 28747 });
       let takeoverCallbacks = 0;
       server.setOnTakeoverCallback(async () => {
         takeoverCallbacks += 1;
@@ -80,15 +84,15 @@ describe("web server health check", () => {
 
       await attemptTakeover();
       expect(server.isServerOwner()).toBe(false);
-      expect(server.getUrl()).toBe("http://127.0.0.1:48747");
+      expect(server.getUrl()).toBe("http://127.0.0.1:28747");
 
       await attemptTakeover();
       expect(server.isServerOwner()).toBe(false);
-      expect(server.getUrl()).toBe("http://127.0.0.1:48747");
+      expect(server.getUrl()).toBe("http://127.0.0.1:28747");
 
       await attemptTakeover();
       expect(server.isServerOwner()).toBe(true);
-      expect(server.getUrl()).toBe("http://127.0.0.1:48748");
+      expect(server.getUrl()).toBe("http://127.0.0.1:28748");
       expect(takeoverCallbacks).toBe(1);
 
       const response = await fetch(`${server.getUrl()}/api/health`);
@@ -107,13 +111,13 @@ describe("web server health check", () => {
       res.writeHead(200);
       res.end("occupied");
     });
-    await new Promise<void>((resolve) => occupy.listen(48747, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => occupy.listen(28747, "127.0.0.1", resolve));
 
     const originalRandom = Math.random;
     Math.random = () => 0;
 
     try {
-      const server = new WebServer({ enabled: true, host: "127.0.0.1", port: 48747 });
+      const server = new WebServer({ enabled: true, host: "127.0.0.1", port: 28747 });
       // fail, fail, owner recovers, owner dies again
       const availability = [false, false, true, false];
       server.checkServerAvailable = async () => availability.shift() ?? false;
@@ -124,7 +128,7 @@ describe("web server health check", () => {
 
       await attemptTakeover();
       await attemptTakeover();
-      expect(server.getUrl()).toBe("http://127.0.0.1:48747");
+      expect(server.getUrl()).toBe("http://127.0.0.1:28747");
 
       // Owner recovers: counter resets, we stay a passive non-owner.
       await attemptTakeover();
@@ -134,7 +138,7 @@ describe("web server health check", () => {
       // because the stale count (2) was reset on recovery.
       await attemptTakeover();
       expect(server.isServerOwner()).toBe(false);
-      expect(server.getUrl()).toBe("http://127.0.0.1:48747");
+      expect(server.getUrl()).toBe("http://127.0.0.1:28747");
 
       await server.stop();
     } finally {
@@ -148,20 +152,20 @@ describe("web server health check", () => {
       res.writeHead(200);
       res.end("occupied");
     });
-    await new Promise<void>((resolve) => occupy.listen(48747, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => occupy.listen(28747, "127.0.0.1", resolve));
 
     const originalRandom = Math.random;
     Math.random = () => 0;
 
     try {
-      const server = new WebServer({ enabled: true, host: "127.0.0.1", port: 48747 });
+      const server = new WebServer({ enabled: true, host: "127.0.0.1", port: 28747 });
       let exhaustedSignals = 0;
       server.setOnPortsExhaustedCallback(() => {
         exhaustedSignals += 1;
       });
       server.checkServerAvailable = async () => false;
       // Collapse the candidate range to the original port so one attempt exhausts it.
-      (server as unknown as { maxFallbackPort: number }).maxFallbackPort = 48747;
+      (server as unknown as { maxFallbackPort: number }).maxFallbackPort = 28747;
 
       const attemptTakeover = (
         server as unknown as { attemptTakeover(): Promise<void> }

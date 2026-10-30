@@ -1,4 +1,4 @@
-import { existsSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { tursoShardManager } from "./turso/shard-manager.js";
 import { tursoConnectionManager } from "./turso/connection-manager.js";
 import { tursoVectorSearch } from "./turso/vector-search.js";
@@ -8,8 +8,15 @@ import { CONFIG } from "../config.js";
 import { log } from "./logger.js";
 import { formatTagsForEmbedding } from "./turso/vector-utils.js";
 import type { MemoryRecord, ShardInfo } from "./turso/types.js";
-import { acquireTursoOperationLock } from "./turso/operation-lock.js";
-import { withSqliteFileLockRetry } from "./turso/sqlite-handle-release.js";
+import {
+  acquireTursoOperationLock,
+  isTursoLockOwnershipLostError,
+} from "./turso/operation-lock.js";
+import {
+  withSqliteFileLockRetry,
+  renameSqliteDatabase,
+  removeSqliteDatabase,
+} from "./turso/sqlite-handle-release.js";
 
 export interface DimensionMismatch {
   needsMigration: boolean;
@@ -101,13 +108,15 @@ export class MigrationService {
     }
 
     this.isRunning = true;
-    let releaseOperationLock: (() => void) | undefined;
+    let releaseOperationLock: ReturnType<typeof acquireTursoOperationLock> | undefined;
     this.progressCallback = progressCallback;
     const startTime = Date.now();
 
     try {
       releaseOperationLock = acquireTursoOperationLock(`dimension-${strategy}`);
+      const heartbeat = releaseOperationLock.heartbeat;
       const mismatch = await this.detectDimensionMismatch();
+      heartbeat();
 
       if (!mismatch.needsMigration) {
         return {
@@ -120,10 +129,10 @@ export class MigrationService {
       }
 
       if (strategy === "fresh-start") {
-        return await this.freshStartMigration(mismatch, startTime);
+        return await this.freshStartMigration(mismatch, startTime, heartbeat);
       }
 
-      return await this.reEmbedMigration(mismatch, startTime);
+      return await this.reEmbedMigration(mismatch, startTime, heartbeat);
     } catch (error) {
       log("Migration: failed", { error: String(error) });
       return {
@@ -143,7 +152,8 @@ export class MigrationService {
 
   private async freshStartMigration(
     mismatch: DimensionMismatch,
-    startTime: number
+    startTime: number,
+    heartbeat: () => void
   ): Promise<MigrationResult> {
     this.reportProgress({
       phase: "preparing",
@@ -154,6 +164,7 @@ export class MigrationService {
     let deletedShards = 0;
 
     for (const [index, shardInfo] of mismatch.shardMismatches.entries()) {
+      heartbeat();
       this.reportProgress({
         phase: "cleanup",
         processed: index,
@@ -170,6 +181,7 @@ export class MigrationService {
         archivePath,
       });
       deletedShards++;
+      heartbeat();
     }
 
     this.reportProgress({
@@ -189,9 +201,13 @@ export class MigrationService {
 
   private async reEmbedMigration(
     mismatch: DimensionMismatch,
-    startTime: number
+    startTime: number,
+    heartbeat: () => void
   ): Promise<MigrationResult> {
+    // Warmup (ONNX load / remote probes) can outlast a single lease window.
+    heartbeat();
     await embeddingService.warmup();
+    heartbeat();
     embeddingService.clearCache();
 
     const totalMemories = mismatch.shardMismatches.reduce(
@@ -209,6 +225,7 @@ export class MigrationService {
     let processedCount = 0;
 
     for (const shardInfo of mismatch.shardMismatches) {
+      heartbeat();
       this.reportProgress({
         phase: "re-embedding",
         processed: processedCount,
@@ -225,7 +242,8 @@ export class MigrationService {
         shard.scope,
         shard.scopeHash,
         () =>
-          this.rebuildShardSafely(shard, (processed) => {
+          this.rebuildShardSafely(shard, heartbeat, (processed) => {
+            heartbeat();
             processedCount++;
             this.reportProgress({
               phase: "re-embedding",
@@ -240,6 +258,7 @@ export class MigrationService {
           })
       );
       reEmbeddedCount += migrated;
+      heartbeat();
     }
 
     this.reportProgress({
@@ -259,6 +278,7 @@ export class MigrationService {
 
   private async rebuildShardSafely(
     shard: ShardInfo,
+    heartbeat: () => void,
     onProcessed: (memoryId: string) => void
   ): Promise<number> {
     const sourceDb = await tursoConnectionManager.getConnection(shard.dbPath);
@@ -314,6 +334,7 @@ export class MigrationService {
               createdAt: Number(memory.created_at),
               updatedAt: Number(memory.updated_at),
               metadata: memory.metadata ? String(memory.metadata) : undefined,
+              sessionId: memory.session_id ? String(memory.session_id) : undefined,
               displayName: memory.display_name ? String(memory.display_name) : undefined,
               userName: memory.user_name ? String(memory.user_name) : undefined,
               userEmail: memory.user_email ? String(memory.user_email) : undefined,
@@ -326,6 +347,7 @@ export class MigrationService {
           onProcessed(String(memory.id));
         }
 
+        heartbeat();
         await stagedDb.transaction("write", async (tx) => {
           for (const item of stagedBatch) {
             await tursoVectorSearch.insertVectorInTransaction(tx, item.record);
@@ -337,6 +359,7 @@ export class MigrationService {
             }
           }
         });
+        heartbeat();
       }
 
       const countRow = await stagedDb.get(`SELECT COUNT(*) AS count FROM memories`);
@@ -348,17 +371,19 @@ export class MigrationService {
       }
 
       await tursoConnectionManager.closeConnection(stagedPath);
+      heartbeat();
       writeFileSync(
         swapStatePath,
         JSON.stringify({ dbPath: shard.dbPath, stagedPath, backupPath }),
         "utf-8"
       );
       await tursoConnectionManager.closeConnection(shard.dbPath);
-      await withSqliteFileLockRetry(() => renameSync(shard.dbPath, backupPath));
+      heartbeat();
+      await withSqliteFileLockRetry(() => renameSqliteDatabase(shard.dbPath, backupPath));
       try {
-        await withSqliteFileLockRetry(() => renameSync(stagedPath, shard.dbPath));
+        await withSqliteFileLockRetry(() => renameSqliteDatabase(stagedPath, shard.dbPath));
       } catch (error) {
-        await withSqliteFileLockRetry(() => renameSync(backupPath, shard.dbPath));
+        await withSqliteFileLockRetry(() => renameSqliteDatabase(backupPath, shard.dbPath));
         throw error;
       }
 
@@ -372,11 +397,24 @@ export class MigrationService {
       return stagedCount;
     } catch (error) {
       await tursoConnectionManager.closeConnection(stagedPath);
-      if (existsSync(stagedPath)) {
-        await withSqliteFileLockRetry(() => unlinkSync(stagedPath));
-      }
-      if (existsSync(swapStatePath) && existsSync(shard.dbPath)) {
-        unlinkSync(swapStatePath);
+      if (isTursoLockOwnershipLostError(error)) {
+        // The journal path is shared per shard. A successor may already own it
+        // (and the lock); never unlink it after ownership loss. Only discard our
+        // nonce-scoped staged file when the source shard is still in place.
+        log(
+          "WARNING: Re-embed interrupted after lock ownership lost; leaving swap journal untouched",
+          { error: String(error), swapStatePath, dbPath: shard.dbPath }
+        );
+        if (existsSync(shard.dbPath) && existsSync(stagedPath)) {
+          await withSqliteFileLockRetry(() => removeSqliteDatabase(stagedPath));
+        }
+      } else {
+        if (existsSync(stagedPath)) {
+          await withSqliteFileLockRetry(() => removeSqliteDatabase(stagedPath));
+        }
+        if (existsSync(swapStatePath) && existsSync(shard.dbPath)) {
+          unlinkSync(swapStatePath);
+        }
       }
       throw error;
     }

@@ -38,7 +38,7 @@ type RequestBody = {
   model: string;
   messages: APIMessage[];
   tools: ChatCompletionTool[];
-  tool_choice: "auto";
+  tool_choice: "auto" | "required";
   temperature?: number;
   [key: string]: unknown;
 };
@@ -94,6 +94,126 @@ function repairInnerQuotes(json: string): string {
   return result;
 }
 
+/** Some OpenAI-compatible gateways reject non-streaming chat/completions (e.g. codebuddy). */
+export function isStreamRequiredError(status: number, errorText: string): boolean {
+  if (status !== 400) return false;
+  return /non[- ]?stream/i.test(errorText) || /only\s+supports?\s+stream/i.test(errorText);
+}
+
+type AccumulatedToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+/**
+ * Collapse an OpenAI chat-completions SSE body into the non-streaming response
+ * shape expected by executeToolCall (choices[0].message with merged tool_calls).
+ */
+export async function parseChatCompletionStream(response: Response): Promise<unknown> {
+  const text = await response.text();
+  const toolCallsByIndex = new Map<number, AccumulatedToolCall>();
+  let content = "";
+  let finishReason: string | undefined;
+
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") {
+      if (payload === "[DONE]") break;
+      continue;
+    }
+
+    let chunk: {
+      choices?: Array<{
+        finish_reason?: string | null;
+        delta?: {
+          content?: string | null;
+          tool_calls?: Array<{
+            index?: number;
+            id?: string;
+            type?: string;
+            function?: { name?: string; arguments?: string };
+          }>;
+        };
+        message?: {
+          content?: string | null;
+          tool_calls?: AccumulatedToolCall[];
+        };
+      }>;
+    };
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+
+    // Some gateways emit a full message object instead of deltas.
+    if (choice.message) {
+      if (typeof choice.message.content === "string") {
+        content = choice.message.content;
+      }
+      if (Array.isArray(choice.message.tool_calls)) {
+        choice.message.tool_calls.forEach((tc, index) => {
+          toolCallsByIndex.set(index, {
+            id: tc.id,
+            type: "function",
+            function: {
+              name: tc.function?.name ?? "",
+              arguments: tc.function?.arguments ?? "",
+            },
+          });
+        });
+      }
+      continue;
+    }
+
+    const delta = choice.delta;
+    if (!delta) continue;
+    if (typeof delta.content === "string") content += delta.content;
+    if (!Array.isArray(delta.tool_calls)) continue;
+
+    for (const tc of delta.tool_calls) {
+      const index = typeof tc.index === "number" ? tc.index : 0;
+      let acc = toolCallsByIndex.get(index);
+      if (!acc) {
+        acc = {
+          id: tc.id ?? `call_${index}`,
+          type: "function",
+          function: { name: "", arguments: "" },
+        };
+        toolCallsByIndex.set(index, acc);
+      }
+      if (tc.id) acc.id = tc.id;
+      if (tc.function?.name) acc.function.name += tc.function.name;
+      if (typeof tc.function?.arguments === "string") {
+        acc.function.arguments += tc.function.arguments;
+      }
+    }
+  }
+
+  const tool_calls = [...toolCallsByIndex.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, value]) => value);
+
+  return {
+    choices: [
+      {
+        message: {
+          content: content || null,
+          ...(tool_calls.length > 0 ? { tool_calls } : {}),
+        },
+        finish_reason: finishReason,
+      },
+    ],
+  };
+}
+
 export class OpenAIChatCompletionProvider extends BaseAIProvider {
   private readonly aiSessionManager: AISessionManager;
 
@@ -103,7 +223,7 @@ export class OpenAIChatCompletionProvider extends BaseAIProvider {
   }
 
   getProviderName(): string {
-    return "openai-chat";
+    return this.sessionProviderTag();
   }
 
   supportsSession(): boolean {
@@ -260,20 +380,28 @@ export class OpenAIChatCompletionProvider extends BaseAIProvider {
       const timeout = setTimeout(() => controller.abort(), iterationTimeout);
 
       try {
-        const requestBody: RequestBody = {
-          model: this.resolveModel(),
-          messages,
-          tools: [toolSchema],
-          tool_choice: "auto",
+        const buildRequestBody = (stream: boolean): RequestBody => {
+          const requestBody: RequestBody = {
+            model: this.resolveModel(),
+            messages,
+            tools: [toolSchema],
+            tool_choice: this.config.forceToolChoice === false ? "auto" : "required",
+          };
+
+          if (this.config.memoryTemperature !== false) {
+            requestBody.temperature = this.config.memoryTemperature ?? 0.3;
+          }
+
+          if (this.config.extraParams) {
+            applySafeExtraParams(requestBody, this.config.extraParams);
+          }
+
+          if (stream) {
+            requestBody.stream = true;
+          }
+
+          return requestBody;
         };
-
-        if (this.config.memoryTemperature !== false) {
-          requestBody.temperature = this.config.memoryTemperature ?? 0.3;
-        }
-
-        if (this.config.extraParams) {
-          applySafeExtraParams(requestBody, this.config.extraParams);
-        }
 
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -283,12 +411,68 @@ export class OpenAIChatCompletionProvider extends BaseAIProvider {
           headers.Authorization = `Bearer ${this.config.apiKey}`;
         }
 
-        const response = await fetch(`${this.resolveEndpoint()}/chat/completions`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(requestBody),
-          signal: controller.signal,
-        });
+        const postCompletion = async (stream: boolean) => {
+          const response = await fetch(`${this.resolveEndpoint()}/chat/completions`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(buildRequestBody(stream)),
+            signal: controller.signal,
+          });
+          return response;
+        };
+
+        let usedStream = false;
+        let response = await postCompletion(false);
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => response.statusText);
+          if (isStreamRequiredError(response.status, errorText)) {
+            log("OpenAI Chat Completion API requires streaming; retrying with stream:true", {
+              provider: this.getProviderName(),
+              model: this.config.model,
+              status: response.status,
+              error: errorText,
+              iteration: iterations,
+            });
+            usedStream = true;
+            response = await postCompletion(true);
+          } else {
+            clearTimeout(timeout);
+            log("OpenAI Chat Completion API error", {
+              provider: this.getProviderName(),
+              model: this.config.model,
+              status: response.status,
+              error: errorText,
+              iteration: iterations,
+            });
+
+            let errorMessage = `API error: ${response.status} - ${errorText}`;
+
+            if (
+              response.status === 400 &&
+              errorText.includes("unsupported_value") &&
+              errorText.includes("temperature")
+            ) {
+              errorMessage =
+                'Your model does not support the temperature parameter. Add "memoryTemperature": false to your config file to disable it.';
+            } else if (
+              response.status === 400 &&
+              /tool_choice/i.test(errorText) &&
+              (/Thinking mode does not support/i.test(errorText) ||
+                /unsupported/i.test(errorText) ||
+                /not support/i.test(errorText))
+            ) {
+              errorMessage =
+                'Your model does not support tool_choice "required". Add "forceToolChoice": false to your config file to fall back to "auto".';
+            }
+
+            return {
+              success: false,
+              error: errorMessage,
+              iterations,
+            };
+          }
+        }
 
         clearTimeout(timeout);
 
@@ -300,27 +484,18 @@ export class OpenAIChatCompletionProvider extends BaseAIProvider {
             status: response.status,
             error: errorText,
             iteration: iterations,
+            streamed: usedStream,
           });
-
-          let errorMessage = `API error: ${response.status} - ${errorText}`;
-
-          if (
-            response.status === 400 &&
-            errorText.includes("unsupported_value") &&
-            errorText.includes("temperature")
-          ) {
-            errorMessage =
-              'Your model does not support the temperature parameter. Add "memoryTemperature": false to your config file to disable it.';
-          }
-
           return {
             success: false,
-            error: errorMessage,
+            error: `API error: ${response.status} - ${errorText}`,
             iterations,
           };
         }
 
-        const data: unknown = await response.json();
+        const data: unknown = usedStream
+          ? await parseChatCompletionStream(response)
+          : await response.json();
 
         if (isErrorResponseBody(data)) {
           log("API returned error in response body", {
@@ -457,11 +632,7 @@ export class OpenAIChatCompletionProvider extends BaseAIProvider {
                   JSON.stringify({ success: false, error: errorMessage })
                 );
 
-                return {
-                  success: false,
-                  error: errorMessage,
-                  iterations,
-                };
+                break;
               }
             }
 

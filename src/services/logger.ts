@@ -103,17 +103,55 @@ function cleanupOldLogs() {
 }
 
 function ensureLoggerInitialized() {
-  if ((globalThis as any)[GLOBAL_LOGGER_KEY]) return;
   const logDir = getLogDirPath();
-  const logFile = getLogFilePath();
+  // Re-init when the log directory changes (tests sandbox HOME / USERPROFILE).
+  if ((globalThis as any)[GLOBAL_LOGGER_KEY] === logDir && existsSync(logDir)) return;
   if (!existsSync(logDir)) {
     mkdirSync(logDir, { recursive: true });
   }
   rotateLog();
+  const logFile = getLogFilePath();
   writeFileSync(logFile, `\n--- Session started: ${formatTimestamp(new Date())} ---\n`, {
     flag: "a",
   });
-  (globalThis as any)[GLOBAL_LOGGER_KEY] = true;
+  (globalThis as any)[GLOBAL_LOGGER_KEY] = logDir;
+}
+
+/** Structured fields for log payloads so callers keep `error` + stack/cause. */
+export function serializeError(error: unknown): {
+  error: string;
+  name?: string;
+  stack?: string;
+  cause?: string;
+} {
+  if (error instanceof Error) {
+    const cause =
+      error.cause instanceof Error
+        ? error.cause.message
+        : error.cause !== undefined
+          ? String(error.cause)
+          : undefined;
+    return {
+      error: error.message,
+      name: error.name,
+      ...(error.stack ? { stack: error.stack } : {}),
+      ...(cause !== undefined ? { cause } : {}),
+    };
+  }
+  return { error: String(error) };
+}
+
+/**
+ * Log without letting a logger failure escape. `log()` initialises the log
+ * directory lazily and can throw on ENOSPC/EACCES; callers on a teardown path
+ * must never let a diagnostic write skip the work that follows it.
+ */
+export function safeLog(message: string, data?: unknown): void {
+  try {
+    log(message, data);
+  } catch {
+    // swallow — the caller's cleanup matters more than this line
+  }
 }
 
 export function log(message: string, data?: unknown) {
@@ -130,5 +168,14 @@ export function log(message: string, data?: unknown) {
   const line = data
     ? `[${timestamp}] ${message}: ${JSON.stringify(data)}\n`
     : `[${timestamp}] ${message}\n`;
-  appendFileSync(logFile, line);
+  try {
+    appendFileSync(logFile, line);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT") throw error;
+    // Directory may have been removed after init (parallel test sandboxes).
+    (globalThis as any)[GLOBAL_LOGGER_KEY] = undefined;
+    ensureLoggerInitialized();
+    appendFileSync(logFile, line);
+  }
 }

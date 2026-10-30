@@ -20,12 +20,19 @@ export interface MemoryRecord {
   createdAt: number;
   updatedAt: number;
   metadata?: string;
+  /** Indexed OpenCode session id (also mirrored in metadata.sessionID). */
+  sessionId?: string;
   displayName?: string;
   userName?: string;
   userEmail?: string;
   projectPath?: string;
   projectName?: string;
   gitRepoUrl?: string;
+}
+
+export interface MemoryListFilters {
+  excludeSessionId?: string;
+  createdAfter?: number;
 }
 
 export interface SearchResult {

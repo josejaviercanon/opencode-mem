@@ -8,7 +8,7 @@ import type {
 } from "./session-types.js";
 import { tursoConnectionManager } from "../../turso/connection-manager.js";
 import { CONFIG } from "../../../config.js";
-import type { InValue } from "@libsql/client";
+import type { SqlValue } from "../../turso/turso-db.js";
 import type { TursoDb } from "../../turso/turso-db.js";
 
 const AI_SESSIONS_DB_NAME = "ai-sessions.db";
@@ -52,10 +52,16 @@ export class AISessionManager {
   }
 
   private async ready(): Promise<TursoDb> {
-    if (!this.db || !this.initPromise) {
+    await this.initialize();
+    // Connection manager is authoritative: another plugin instance's dispose
+    // may close/replace the pooled handle underneath a cached TursoDb (#443).
+    if (this.db) {
+      const current = await tursoConnectionManager.getConnection(this.dbPath);
+      if (current === this.db) {
+        return this.db;
+      }
+      this.reset();
       await this.initialize();
-    } else {
-      await this.initPromise;
     }
 
     if (!this.db) {
@@ -67,47 +73,12 @@ export class AISessionManager {
 
   private async initDatabase(): Promise<void> {
     const db = this.db!;
-    await db.batch([
-      {
-        sql: `
-          CREATE TABLE IF NOT EXISTS ai_sessions (
-            id TEXT PRIMARY KEY,
-            provider TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            conversation_id TEXT,
-            metadata TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
-          )
-        `,
-      },
-      { sql: "CREATE INDEX IF NOT EXISTS idx_ai_sessions_session_id ON ai_sessions(session_id)" },
-      { sql: "CREATE INDEX IF NOT EXISTS idx_ai_sessions_expires_at ON ai_sessions(expires_at)" },
-      { sql: "CREATE INDEX IF NOT EXISTS idx_ai_sessions_provider ON ai_sessions(provider)" },
-      {
-        sql: `
-          CREATE TABLE IF NOT EXISTS ai_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ai_session_id TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tool_calls TEXT,
-            tool_call_id TEXT,
-            content_blocks TEXT,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY (ai_session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE
-          )
-        `,
-      },
-      {
-        sql: "CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages(ai_session_id, sequence)",
-      },
-      {
-        sql: "CREATE INDEX IF NOT EXISTS idx_ai_messages_role ON ai_messages(ai_session_id, role)",
-      },
-    ]);
+    const { applySchemaMigrations, AI_SESSIONS_MIGRATIONS } =
+      await import("../../turso/schema-migrations.js");
+    await applySchemaMigrations(db, AI_SESSIONS_MIGRATIONS, {
+      dbPath: this.dbPath,
+      label: "ai-sessions.db",
+    });
   }
 
   async getSession(sessionId: string, provider: AIProviderType): Promise<AISession | null> {
@@ -157,7 +128,7 @@ export class AISessionManager {
   ): Promise<void> {
     const db = await this.ready();
     const fields: string[] = [];
-    const values: InValue[] = [];
+    const values: SqlValue[] = [];
 
     if (updates.conversationId !== undefined) {
       fields.push("conversation_id = ?");

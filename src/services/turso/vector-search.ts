@@ -1,9 +1,15 @@
 import { tursoConnectionManager } from "./connection-manager.js";
+import { tursoShardManager } from "./shard-manager.js";
 import { log } from "../logger.js";
-import type { MemoryRecord, SearchResult, ShardInfo } from "./types.js";
-import { distanceToSimilarity, vectorToJson } from "./vector-utils.js";
-import type { TursoDb } from "./turso-db.js";
-import type { Transaction } from "@libsql/client";
+import type { MemoryListFilters, MemoryRecord, SearchResult, ShardInfo } from "./types.js";
+import {
+  distanceToSimilarity,
+  escapeLikePattern,
+  parseSessionIdFromMetadata,
+  tokenizeQueryText,
+  vectorToJson,
+} from "./vector-utils.js";
+import type { TursoDb, TursoTx } from "./turso-db.js";
 
 function parseMetadata(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "string") return undefined;
@@ -14,93 +20,80 @@ function parseMetadata(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
-export class TursoVectorSearch {
-  async insertVectorInTransaction(tx: Transaction, record: MemoryRecord): Promise<void> {
-    const contentVector = vectorToJson(record.vector);
-    const commonArgs = [
-      record.containerTag,
-      record.tags || null,
-      record.type || null,
-      record.createdAt,
-      record.updatedAt,
-      record.metadata || null,
-      record.displayName || null,
-      record.userName || null,
-      record.userEmail || null,
-      record.projectPath || null,
-      record.projectName || null,
-      record.gitRepoUrl || null,
-    ];
+function resolveSessionId(record: MemoryRecord): string | null {
+  if (record.sessionId && record.sessionId.length > 0) return record.sessionId;
+  return parseSessionIdFromMetadata(record.metadata);
+}
 
+function insertArgs(record: MemoryRecord, contentVector: string, tagsVectorJson: string | null) {
+  return [
+    record.id,
+    record.content,
+    contentVector,
+    ...(tagsVectorJson ? [tagsVectorJson] : []),
+    record.containerTag,
+    record.tags || null,
+    record.type || null,
+    record.createdAt,
+    record.updatedAt,
+    record.metadata || null,
+    resolveSessionId(record),
+    record.displayName || null,
+    record.userName || null,
+    record.userEmail || null,
+    record.projectPath || null,
+    record.projectName || null,
+    record.gitRepoUrl || null,
+  ];
+}
+
+const INSERT_WITH_TAGS = `
+  INSERT INTO memories (
+    id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
+    metadata, session_id, display_name, user_name, user_email, project_path, project_name, git_repo_url
+  ) VALUES (?, ?, vector32(?), vector32(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
+const INSERT_WITHOUT_TAGS = `
+  INSERT INTO memories (
+    id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
+    metadata, session_id, display_name, user_name, user_email, project_path, project_name, git_repo_url
+  ) VALUES (?, ?, vector32(?), NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
+export class TursoVectorSearch {
+  private async prepareShardDb(db: TursoDb): Promise<void> {
+    await tursoShardManager.ensureShardSchema(db);
+  }
+
+  async insertVectorInTransaction(tx: TursoTx, record: MemoryRecord): Promise<void> {
+    const contentVector = vectorToJson(record.vector);
     if (record.tagsVector) {
       await tx.execute({
-        sql: `
-        INSERT INTO memories (
-          id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
-          metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
-        ) VALUES (?, ?, vector32(?), vector32(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-        args: [
-          record.id,
-          record.content,
-          contentVector,
-          vectorToJson(record.tagsVector),
-          ...commonArgs,
-        ],
+        sql: INSERT_WITH_TAGS,
+        args: insertArgs(record, contentVector, vectorToJson(record.tagsVector)),
       });
       return;
     }
 
     await tx.execute({
-      sql: `
-      INSERT INTO memories (
-        id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
-        metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
-      ) VALUES (?, ?, vector32(?), NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-      args: [record.id, record.content, contentVector, ...commonArgs],
+      sql: INSERT_WITHOUT_TAGS,
+      args: insertArgs(record, contentVector, null),
     });
   }
 
   async insertVector(db: TursoDb, record: MemoryRecord): Promise<void> {
+    await this.prepareShardDb(db);
     const contentVector = vectorToJson(record.vector);
-    const commonArgs = [
-      record.containerTag,
-      record.tags || null,
-      record.type || null,
-      record.createdAt,
-      record.updatedAt,
-      record.metadata || null,
-      record.displayName || null,
-      record.userName || null,
-      record.userEmail || null,
-      record.projectPath || null,
-      record.projectName || null,
-      record.gitRepoUrl || null,
-    ];
-
     if (record.tagsVector) {
       await db.execute(
-        `
-        INSERT INTO memories (
-          id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
-          metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
-        ) VALUES (?, ?, vector32(?), vector32(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-        [record.id, record.content, contentVector, vectorToJson(record.tagsVector), ...commonArgs]
+        INSERT_WITH_TAGS,
+        insertArgs(record, contentVector, vectorToJson(record.tagsVector))
       );
       return;
     }
 
-    await db.execute(
-      `
-      INSERT INTO memories (
-        id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
-        metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
-      ) VALUES (?, ?, vector32(?), NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-      [record.id, record.content, contentVector, ...commonArgs]
-    );
+    await db.execute(INSERT_WITHOUT_TAGS, insertArgs(record, contentVector, null));
   }
 
   async searchInShard(
@@ -111,44 +104,31 @@ export class TursoVectorSearch {
     queryText?: string
   ): Promise<SearchResult[]> {
     const db = await tursoConnectionManager.getConnection(shard.dbPath);
+    await this.prepareShardDb(db);
     const queryJson = vectorToJson(queryVector);
-    // Over-fetch aggressively when filtering by container_tag after ANN,
-    // because post-filtering can discard many DiskANN neighbors.
-    const k = containerTag === "" ? Math.max(limit * 4, 32) : Math.max(limit * 16, 128);
+    // Exact cosine already returns the best-k rows; over-fetch a little so
+    // content+tags+keyword candidates can merge before hybrid re-rank.
+    const k = Math.max(limit * 2, 32);
 
-    const contentResults = await this.searchKind(
-      db,
-      queryJson,
-      k,
-      containerTag,
-      "memories_vec_idx",
-      "vector"
-    );
-    const tagsResults = await this.searchKind(
-      db,
-      queryJson,
-      k,
-      containerTag,
-      "memories_tags_vec_idx",
-      "tags_vector"
-    );
+    const contentResults = await this.exactScanKind(db, queryJson, k, containerTag, "vector");
+    const tagsResults = await this.exactScanKind(db, queryJson, k, containerTag, "tags_vector");
+    const keywordScores = await this.keywordScores(db, queryText, containerTag, k);
 
     const candidateIds = new Set<string>();
     for (const result of contentResults) candidateIds.add(result.id);
     for (const result of tagsResults) candidateIds.add(result.id);
+    for (const id of keywordScores.keys()) candidateIds.add(id);
 
     const ids = Array.from(candidateIds);
     if (ids.length === 0) return [];
 
     const placeholders = ids.map(() => "?").join(",");
-    // Recompute exact distances for hydrated rows so tag-only / content-only ANN
-    // hits still get a full hybrid score (missing ANN side is not forced to 0).
     const rows = await db.all(
       containerTag === ""
         ? `
       SELECT id, content, tags, created_at, metadata, container_tag,
              display_name, user_name, user_email, project_path, project_name,
-             git_repo_url, is_pinned,
+             git_repo_url, is_pinned, session_id,
              vector_distance_cos(vector, vector32(?)) AS content_dist,
              CASE WHEN tags_vector IS NOT NULL
                THEN vector_distance_cos(tags_vector, vector32(?))
@@ -159,7 +139,7 @@ export class TursoVectorSearch {
         : `
       SELECT id, content, tags, created_at, metadata, container_tag,
              display_name, user_name, user_email, project_path, project_name,
-             git_repo_url, is_pinned,
+             git_repo_url, is_pinned, session_id,
              vector_distance_cos(vector, vector32(?)) AS content_dist,
              CASE WHEN tags_vector IS NOT NULL
                THEN vector_distance_cos(tags_vector, vector32(?))
@@ -172,12 +152,8 @@ export class TursoVectorSearch {
         : [queryJson, queryJson, ...ids, containerTag]
     );
 
-    const queryWords = queryText
-      ? queryText
-          .toLowerCase()
-          .split(/[\s,]+/)
-          .filter((word) => word.length > 1)
-      : [];
+    const queryWords = tokenizeQueryText(queryText);
+    const hasKeyword = queryWords.length > 0;
 
     const hydratedResults = rows.map((row: Record<string, unknown>) => {
       const contentSim = distanceToSimilarity(Number(row.content_dist));
@@ -186,7 +162,11 @@ export class TursoVectorSearch {
           ? 0
           : distanceToSimilarity(Number(row.tags_dist));
       const memoryTagsStr = String(row.tags || "");
-      const memoryTags = memoryTagsStr.split(",").map((tag) => tag.trim().toLowerCase());
+      // filter(Boolean): "".split(",") → [""], and "query".includes("") is always true.
+      const memoryTags = memoryTagsStr
+        .split(",")
+        .map((tag) => tag.trim().toLowerCase())
+        .filter(Boolean);
 
       let exactMatchBoost = 0;
       if (queryWords.length > 0 && memoryTags.length > 0) {
@@ -196,8 +176,12 @@ export class TursoVectorSearch {
         exactMatchBoost = matches / Math.max(queryWords.length, 1);
       }
 
+      const keywordSim = keywordScores.get(String(row.id)) ?? 0;
       const finalTagsSim = Math.max(tagsSim, exactMatchBoost);
-      const similarity = contentSim * 0.6 + finalTagsSim * 0.4;
+      // With query text: blend vector + keyword. Without: keep classic 0.6/0.4.
+      const similarity = hasKeyword
+        ? contentSim * 0.5 + finalTagsSim * 0.3 + keywordSim * 0.2
+        : contentSim * 0.6 + finalTagsSim * 0.4;
 
       return {
         id: String(row.id),
@@ -221,43 +205,44 @@ export class TursoVectorSearch {
     return hydratedResults.slice(0, Math.max(0, limit));
   }
 
-  private async searchKind(
+  /**
+   * Keyword recall for hybrid ranking.
+   * `@tursodatabase/database` does not ship FTS5, so we use tokenized LIKE
+   * over content/tags (bounded tokens, ESCAPE-safe).
+   */
+  private async keywordScores(
     db: TursoDb,
-    queryJson: string,
-    k: number,
+    queryText: string | undefined,
     containerTag: string,
-    indexName: string,
-    columnName: string
-  ): Promise<Array<{ id: string; similarity: number }>> {
-    try {
+    limit: number
+  ): Promise<Map<string, number>> {
+    const tokens = tokenizeQueryText(queryText);
+    if (tokens.length === 0) return new Map();
+
+    const scores = new Map<string, number>();
+    for (const token of tokens) {
+      const pattern = `%${escapeLikePattern(token)}%`;
       const rows = await db.all(
         containerTag === ""
           ? `
-          SELECT m.id AS id, vector_distance_cos(m.${columnName}, vector32(?)) AS dist
-          FROM vector_top_k('${indexName}', vector32(?), ?) AS v
-          CROSS JOIN memories m ON m.rowid = v.id
-          WHERE m.${columnName} IS NOT NULL
+          SELECT id FROM memories
+          WHERE content LIKE ? ESCAPE '\\' OR IFNULL(tags, '') LIKE ? ESCAPE '\\'
+          LIMIT ?
         `
           : `
-          SELECT m.id AS id, vector_distance_cos(m.${columnName}, vector32(?)) AS dist
-          FROM vector_top_k('${indexName}', vector32(?), ?) AS v
-          CROSS JOIN memories m ON m.rowid = v.id
-          WHERE m.${columnName} IS NOT NULL AND m.container_tag = ?
+          SELECT id FROM memories
+          WHERE container_tag = ?
+            AND (content LIKE ? ESCAPE '\\' OR IFNULL(tags, '') LIKE ? ESCAPE '\\')
+          LIMIT ?
         `,
-        containerTag === "" ? [queryJson, queryJson, k] : [queryJson, queryJson, k, containerTag]
+        containerTag === "" ? [pattern, pattern, limit] : [containerTag, pattern, pattern, limit]
       );
-
-      return rows.map((row) => ({
-        id: String(row.id),
-        similarity: distanceToSimilarity(Number(row.dist)),
-      }));
-    } catch (error) {
-      log("Turso vector_top_k failed; falling back to exact scan", {
-        indexName,
-        error: String(error),
-      });
-      return this.exactScanKind(db, queryJson, k, containerTag, columnName);
+      for (const row of rows) {
+        const id = String(row.id);
+        scores.set(id, (scores.get(id) ?? 0) + 1 / tokens.length);
+      }
     }
+    return scores;
   }
 
   private async exactScanKind(
@@ -374,26 +359,41 @@ export class TursoVectorSearch {
   async listMemories(
     db: TursoDb,
     containerTag: string,
-    limit: number
+    limit: number,
+    filters: MemoryListFilters = {}
   ): Promise<Record<string, unknown>[]> {
-    return containerTag === ""
-      ? db.all(
-          `
+    const conditions: string[] = [];
+    const args: Array<string | number> = [];
+    if (containerTag !== "") {
+      conditions.push("container_tag = ?");
+      args.push(containerTag);
+    }
+    if (filters.excludeSessionId !== undefined) {
+      // Prefer the indexed session_id column (same resolution as insert/get-by-session),
+      // then fall back to metadata.sessionID for legacy rows. Absent/malformed metadata
+      // with a null session_id stays eligible — matching prior JS undefined semantics.
+      conditions.push(
+        `COALESCE(
+          NULLIF(session_id, ''),
+          CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.sessionID') END
+        ) IS NOT ?`
+      );
+      args.push(filters.excludeSessionId);
+    }
+    if (filters.createdAfter !== undefined) {
+      conditions.push("created_at > ?");
+      args.push(filters.createdAfter);
+    }
+    args.push(limit);
+    return db.all(
+      `
       SELECT * FROM memories
-      ORDER BY created_at DESC
+      ${conditions.length > 0 ? "WHERE " + conditions.join(" AND ") : ""}
+      ORDER BY is_pinned DESC, created_at DESC
       LIMIT ?
     `,
-          [limit]
-        )
-      : db.all(
-          `
-      SELECT * FROM memories
-      WHERE container_tag = ?
-      ORDER BY created_at DESC
-      LIMIT ?
-    `,
-          [containerTag, limit]
-        );
+      args
+    );
   }
 
   async getAllMemories(db: TursoDb): Promise<Record<string, unknown>[]> {
@@ -420,13 +420,15 @@ export class TursoVectorSearch {
   }
 
   async getMemoriesBySessionID(db: TursoDb, sessionID: string): Promise<Record<string, unknown>[]> {
+    await this.prepareShardDb(db);
     const rows = await db.all(
       `
       SELECT * FROM memories
-      WHERE metadata LIKE ?
+      WHERE session_id = ?
+         OR (session_id IS NULL AND metadata LIKE ?)
       ORDER BY created_at DESC
     `,
-      [`%"sessionID":"${sessionID}"%`]
+      [sessionID, `%"sessionID":"${sessionID}"%`]
     );
 
     return rows.map((row) => ({

@@ -80,6 +80,8 @@ describe("turso legacy migrator", () => {
     const { CONFIG } = await import("../src/config.js");
     CONFIG.storagePath = baseDir;
     CONFIG.embeddingDimensions = 768;
+    CONFIG.databaseEncryptionEnabled = false;
+    CONFIG.databaseEncryptionKey = undefined;
 
     const { runLegacyTursoMigration } = await import("../src/services/turso/legacy-migrator.js");
     await runLegacyTursoMigration();
@@ -104,6 +106,176 @@ describe("turso legacy migrator", () => {
     expect(registered[0]?.vectorCount).toBe(1);
   });
 
+  for (const change of ["insert", "delete"] as const) {
+    migrationTest(`keeps migration complete after a normal ${change}`, async () => {
+      baseDir = mkdtempSync(join(tmpdir(), "turso-migrate-completed-"));
+      const projectsDir = join(baseDir, "projects");
+      mkdirSync(projectsDir);
+      const scopeHash = "abcdef0123456789";
+      const dbPath = await createLegacyShard(projectsDir, `project_${scopeHash}_shard_0.db`, [
+        {
+          id: "original",
+          vector: new Float32Array([1, 0, 0, 0]),
+          content: "original memory",
+          containerTag: `opencode_project_${scopeHash}`,
+        },
+      ]);
+      const { CONFIG } = await import("../src/config.js");
+      CONFIG.storagePath = baseDir;
+      CONFIG.embeddingDimensions = 4;
+      CONFIG.databaseEncryptionEnabled = false;
+      CONFIG.databaseEncryptionKey = undefined;
+      const { runLegacyTursoMigration } = await import("../src/services/turso/legacy-migrator.js");
+      const { tursoConnectionManager } =
+        await import("../src/services/turso/connection-manager.js");
+      await runLegacyTursoMigration();
+      const sidecarPath = `${dbPath}.turso-migrate.json`;
+      const sidecar = readFileSync(sidecarPath, "utf-8");
+      const markerPath = join(baseDir, ".turso-migrated");
+      const marker = readFileSync(markerPath, "utf-8");
+      const db = await tursoConnectionManager.getConnection(dbPath);
+      if (change === "insert") {
+        await db.run(`INSERT INTO memories (id, content, vector, container_tag, created_at, updated_at)
+          SELECT 'added', content, vector, container_tag, created_at, updated_at FROM memories`);
+      } else {
+        await db.run("DELETE FROM memories");
+      }
+
+      // A live lock makes any erroneous re-entry fail rather than silently
+      // rewriting the historical counts. A completed shard needs no migration.
+      writeFileSync(
+        join(baseDir, ".turso-migrate.lock"),
+        JSON.stringify({ pid: process.pid, timestamp: new Date().toISOString() })
+      );
+      const { closeTursoAndInvalidateCaches } = await import("../src/services/turso/lifecycle.js");
+      await closeTursoAndInvalidateCaches();
+      await runLegacyTursoMigration();
+      expect(readFileSync(sidecarPath, "utf-8")).toBe(sidecar);
+      expect(readFileSync(markerPath, "utf-8")).toBe(marker);
+      const { tursoShardManager } = await import("../src/services/turso/shard-manager.js");
+      const shards = await tursoShardManager.getAllShards("project", scopeHash);
+      expect(shards[0]?.vectorCount).toBe(change === "insert" ? 2 : 0);
+    });
+  }
+
+  migrationTest("restores unreadable vectors despite a complete sidecar", async () => {
+    baseDir = mkdtempSync(join(tmpdir(), "turso-migrate-complete-corrupt-"));
+    const projectsDir = join(baseDir, "projects");
+    mkdirSync(projectsDir);
+    const dbPath = await createLegacyShard(projectsDir, "project_abcdef0123456789_shard_0.db", [
+      {
+        id: "recoverable",
+        vector: new Float32Array([1, 0, 0, 0]),
+        content: "preserved in backup",
+        containerTag: "opencode_project_abcdef0123456789",
+      },
+    ]);
+    const { CONFIG } = await import("../src/config.js");
+    CONFIG.storagePath = baseDir;
+    CONFIG.embeddingDimensions = 4;
+    CONFIG.databaseEncryptionEnabled = false;
+    CONFIG.databaseEncryptionKey = undefined;
+    const { runLegacyTursoMigration } = await import("../src/services/turso/legacy-migrator.js");
+    const { tursoConnectionManager } = await import("../src/services/turso/connection-manager.js");
+    await runLegacyTursoMigration();
+    const db = await tursoConnectionManager.getConnection(dbPath);
+    await db.run("UPDATE memories SET vector = x'010203'");
+
+    await runLegacyTursoMigration();
+
+    const restoredDb = await tursoConnectionManager.getConnection(dbPath);
+    const row = await restoredDb.get(
+      "SELECT content, vector_extract(vector) AS vector FROM memories"
+    );
+    expect(row?.content).toBe("preserved in backup");
+    expect(JSON.parse(String(row?.vector))).toEqual([1, 0, 0, 0]);
+  });
+
+  for (const loseLock of [false, true, "same-process"] as const) {
+    migrationTest(`heartbeats insert batches (ownership lost: ${loseLock})`, async () => {
+      baseDir = mkdtempSync(join(tmpdir(), "turso-migrate-heartbeat-"));
+      const projectsDir = join(baseDir, "projects");
+      mkdirSync(projectsDir);
+      const dbPath = await createLegacyShard(
+        projectsDir,
+        "project_abcdef0123456789_shard_0.db",
+        Array.from({ length: 51 }, (_, i) => ({
+          id: `batch-${i}`,
+          vector: new Float32Array([1, 0, 0, 0]),
+          content: "batch memory",
+          containerTag: "opencode_project_abcdef0123456789",
+        }))
+      );
+      const { CONFIG } = await import("../src/config.js");
+      CONFIG.storagePath = baseDir;
+      CONFIG.embeddingDimensions = 4;
+      CONFIG.databaseEncryptionEnabled = false;
+      CONFIG.databaseEncryptionKey = undefined;
+      const { TURSO_LOCK_STALE_MS, readLiveTursoLock } =
+        await import("../src/services/turso/operation-lock.js");
+      const { tursoVectorSearch } = await import("../src/services/turso/vector-search.js");
+      const insert = tursoVectorSearch.insertVectorInTransaction;
+      const lockPath = join(baseDir, ".turso-migrate.lock");
+      const oldTimestamp = new Date(Date.now() - TURSO_LOCK_STALE_MS - 60_000).toISOString();
+      let inserted = 0;
+      tursoVectorSearch.insertVectorInTransaction = async function (tx, record) {
+        if (inserted === 0) {
+          const lock = JSON.parse(readFileSync(lockPath, "utf-8"));
+          writeFileSync(
+            lockPath,
+            JSON.stringify({
+              ...lock,
+              id: loseLock === true ? "foreign-acquisition" : lock.id,
+              pid: loseLock === true ? 2147483647 : process.pid,
+              timestamp: oldTimestamp,
+            })
+          );
+          if (loseLock === "same-process") {
+            expect(readLiveTursoLock(lockPath)).toBeNull();
+            writeFileSync(
+              lockPath,
+              JSON.stringify({
+                id: "successor",
+                pid: process.pid,
+                timestamp: new Date().toISOString(),
+              }),
+              { flag: "wx" }
+            );
+          }
+        }
+        if (inserted === 50) {
+          const lock = JSON.parse(readFileSync(lockPath, "utf-8"));
+          expect(Date.parse(lock.timestamp)).toBeGreaterThan(Date.parse(oldTimestamp));
+        }
+        inserted++;
+        return insert.call(this, tx, record);
+      };
+      try {
+        const { runLegacyTursoMigration } =
+          await import("../src/services/turso/legacy-migrator.js");
+        if (loseLock) {
+          await expect(runLegacyTursoMigration()).rejects.toThrow(
+            /ownership lost.*aborting migration/
+          );
+          expect(existsSync(join(baseDir, ".turso-migrated"))).toBe(false);
+          const replacement = JSON.parse(readFileSync(lockPath, "utf-8"));
+          expect(replacement.pid).toBe(loseLock === true ? 2147483647 : process.pid);
+          if (loseLock === "same-process") expect(replacement.id).toBe("successor");
+        } else {
+          await runLegacyTursoMigration();
+          expect(inserted).toBe(51);
+        }
+        const { tursoConnectionManager } =
+          await import("../src/services/turso/connection-manager.js");
+        const db = await tursoConnectionManager.getConnection(dbPath);
+        const row = await db.get("SELECT COUNT(*) AS count FROM memories");
+        expect(Number(row?.count)).toBe(loseLock ? 0 : 51);
+      } finally {
+        tursoVectorSearch.insertVectorInTransaction = insert;
+      }
+    });
+  }
+
   migrationTest("resumes from backup after interrupted migration", async () => {
     baseDir = mkdtempSync(join(tmpdir(), "turso-migrate-resume-"));
     const projectsDir = join(baseDir, "projects");
@@ -123,6 +295,8 @@ describe("turso legacy migrator", () => {
     const { CONFIG } = await import("../src/config.js");
     CONFIG.storagePath = baseDir;
     CONFIG.embeddingDimensions = 768;
+    CONFIG.databaseEncryptionEnabled = false;
+    CONFIG.databaseEncryptionKey = undefined;
 
     const { tursoConnectionManager } = await import("../src/services/turso/connection-manager.js");
     const { tursoShardManager } = await import("../src/services/turso/shard-manager.js");
@@ -225,6 +399,8 @@ describe("turso legacy migrator", () => {
     const { CONFIG } = await import("../src/config.js");
     CONFIG.storagePath = baseDir;
     CONFIG.embeddingDimensions = 768;
+    CONFIG.databaseEncryptionEnabled = false;
+    CONFIG.databaseEncryptionKey = undefined;
 
     const { runLegacyTursoMigration } = await import("../src/services/turso/legacy-migrator.js");
     await expect(runLegacyTursoMigration()).rejects.toThrow(/unreadable vectors/);
@@ -268,6 +444,8 @@ describe("turso legacy migrator", () => {
     const { CONFIG } = await import("../src/config.js");
     CONFIG.storagePath = baseDir;
     CONFIG.embeddingDimensions = 768;
+    CONFIG.databaseEncryptionEnabled = false;
+    CONFIG.databaseEncryptionKey = undefined;
 
     const { runLegacyTursoMigration } = await import("../src/services/turso/legacy-migrator.js");
     await runLegacyTursoMigration();
@@ -277,9 +455,13 @@ describe("turso legacy migrator", () => {
     const indexRow = await db.get(
       `SELECT name FROM sqlite_master WHERE type='index' AND name='memories_vec_idx'`
     );
-    expect(indexRow).toBeTruthy();
+    expect(indexRow).toBeNull();
     const probe = await db.get(`SELECT vector_extract(vector) AS extracted FROM memories LIMIT 1`);
     expect(String(probe?.extracted || "").length).toBeGreaterThan(0);
+    const meta = await db.get(
+      `SELECT value FROM shard_metadata WHERE key = 'embedding_dimensions'`
+    );
+    expect(Number(meta?.value)).toBe(768);
   });
 
   migrationTest(

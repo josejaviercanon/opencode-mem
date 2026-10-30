@@ -3,7 +3,7 @@ import { tursoShardManager } from "./turso/shard-manager.js";
 import { tursoVectorSearch } from "./turso/vector-search.js";
 import { tursoConnectionManager } from "./turso/connection-manager.js";
 import { ensureTursoReady } from "./turso/ready.js";
-import { formatTagsForEmbedding } from "./turso/vector-utils.js";
+import { formatTagsForEmbedding, parseSessionIdFromMetadata } from "./turso/vector-utils.js";
 import { extractScopeFromContainerTag, tryExtractScopeFromContainerTag } from "./memory-scope.js";
 import { log } from "./logger.js";
 import { CONFIG } from "../config.js";
@@ -11,7 +11,23 @@ import type { MemoryType } from "../types/index.js";
 import { userPromptManager } from "./user-prompt/user-prompt-manager.js";
 import type { UserProfileData } from "./user-profile/types.js";
 import { sortProfileItems } from "../utils/profile.js";
+import { toPublicProfileData } from "./user-profile/profile-utils.js";
 import type { ShardInfo } from "./turso/types.js";
+import {
+  collectDailyStats,
+  collectProfileStats,
+  collectShardStats,
+  type CollectDailyStatsOptions,
+} from "./stats-service.js";
+import {
+  deleteMemoryMarkdownFile,
+  getMarkdownStatus,
+  isMarkdownBackend,
+  reindexMarkdownVault,
+  writeMemoryMarkdownFile,
+} from "./markdown/backend.js";
+import { pluginMemoryRelPath } from "./markdown/vault.js";
+import type { ReconcileResult } from "./markdown/reconcile.js";
 
 async function getAllMemoryShards(): Promise<ShardInfo[]> {
   await ensureTursoReady();
@@ -108,39 +124,54 @@ function getProjectPathFromTag(tag: string): Promise<string | undefined> {
   })();
 }
 
-export async function handleListTags(): Promise<ApiResponse<{ project: TagInfo[] }>> {
+function tagInfoFromDistinctRow(t: Record<string, unknown>): TagInfo | null {
+  if (!t.container_tag) return null;
+  return {
+    tag: String(t.container_tag),
+    displayName: t.display_name ? String(t.display_name) : undefined,
+    userName: t.user_name ? String(t.user_name) : undefined,
+    userEmail: t.user_email ? String(t.user_email) : undefined,
+    projectPath: t.project_path ? String(t.project_path) : undefined,
+    projectName: t.project_name ? String(t.project_name) : undefined,
+    gitRepoUrl: t.git_repo_url ? String(t.git_repo_url) : undefined,
+  };
+}
+
+async function collectDistinctTags(
+  scope: "user" | "project",
+  marker: "_user_" | "_project_"
+): Promise<TagInfo[]> {
+  const shards = await tursoShardManager.getAllShards(scope, "");
+  const tagsMap = new Map<string, TagInfo>();
+  for (const shard of shards) {
+    const db = await tursoConnectionManager.getConnection(shard.dbPath);
+    const tags = await tursoVectorSearch.getDistinctTags(db);
+    for (const t of tags) {
+      const tagInfo = tagInfoFromDistinctRow(t);
+      if (!tagInfo || tagsMap.has(tagInfo.tag) || !tagInfo.tag.includes(marker)) continue;
+      tagsMap.set(tagInfo.tag, tagInfo);
+    }
+  }
+  return Array.from(tagsMap.values());
+}
+
+export async function handleListTags(): Promise<
+  ApiResponse<{ project: TagInfo[]; user: TagInfo[] }>
+> {
   try {
     await ensureTursoReady();
     // Tags are stored as SQLite metadata; embedding model is not needed.
     // Calling warmup() here would block on local transformer init in the worker
     // thread and hang every read API. Only handlers that compute similarity
     // (e.g. handleSearch) should warm up the embedding service.
-    const projectShards = await tursoShardManager.getAllShards("project", "");
-    const tagsMap = new Map<string, TagInfo>();
-    for (const shard of projectShards) {
-      const db = await tursoConnectionManager.getConnection(shard.dbPath);
-      const tags = await tursoVectorSearch.getDistinctTags(db);
-      for (const t of tags) {
-        if (t.container_tag && !tagsMap.has(String(t.container_tag))) {
-          tagsMap.set(String(t.container_tag), {
-            tag: String(t.container_tag),
-            displayName: t.display_name ? String(t.display_name) : undefined,
-            userName: t.user_name ? String(t.user_name) : undefined,
-            userEmail: t.user_email ? String(t.user_email) : undefined,
-            projectPath: t.project_path ? String(t.project_path) : undefined,
-            projectName: t.project_name ? String(t.project_name) : undefined,
-            gitRepoUrl: t.git_repo_url ? String(t.git_repo_url) : undefined,
-          });
-        }
-      }
-    }
-    const projectTags: TagInfo[] = [];
-    for (const tagInfo of tagsMap.values()) {
-      if (tagInfo.tag.includes("_project_")) {
-        projectTags.push(tagInfo);
-      }
-    }
-    return { success: true, data: { project: projectTags } };
+    //
+    // Return both scopes: the unfiltered explorer list and /api/stats total
+    // already include user + project memories, so the tag dropdown must too.
+    const [project, user] = await Promise.all([
+      collectDistinctTags("project", "_project_"),
+      collectDistinctTags("user", "_user_"),
+    ]);
+    return { success: true, data: { project, user } };
   } catch (error) {
     log("handleListTags: error", { error: String(error) });
     return { success: false, error: String(error) };
@@ -148,7 +179,7 @@ export async function handleListTags(): Promise<ApiResponse<{ project: TagInfo[]
 }
 
 export async function handleListMemories(
-  tag?: string,
+  tag?: string | string[],
   page: number = 1,
   pageSize: number = 20,
   includePrompts: boolean = true
@@ -157,14 +188,30 @@ export async function handleListMemories(
     await ensureTursoReady();
     // Listing only reads SQLite rows; no vector ops happen here.
     // See handleListTags comment - keep embedding init out of read paths.
+    const filterTags = (Array.isArray(tag) ? tag : tag ? [tag] : [])
+      .map((t) => t.trim())
+      .filter(Boolean);
     const allMemories: any[] = [];
-    if (tag) {
-      const { scope: tagScope, hash } = extractScopeFromTag(tag);
-      const shards = await tursoShardManager.getAllShards(tagScope, hash);
-      for (const shard of shards) {
-        const db = await tursoConnectionManager.getConnection(shard.dbPath);
-        const memories = await tursoVectorSearch.listMemories(db, tag, 10000);
-        allMemories.push(...memories);
+    const seenIds = new Set<string>();
+
+    async function pushUnique(memories: any[]) {
+      for (const memory of memories) {
+        const id = String(memory.id);
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        allMemories.push(memory);
+      }
+    }
+
+    if (filterTags.length > 0) {
+      for (const filterTag of filterTags) {
+        const { scope: tagScope, hash } = extractScopeFromTag(filterTag);
+        const shards = await tursoShardManager.getAllShards(tagScope, hash);
+        for (const shard of shards) {
+          const db = await tursoConnectionManager.getConnection(shard.dbPath);
+          const memories = await tursoVectorSearch.listMemories(db, filterTag, 10000);
+          await pushUnique(memories);
+        }
       }
     } else {
       // Iterate both project- and user-scoped shards. Previously this only
@@ -180,8 +227,8 @@ export async function handleListMemories(
       for (const shard of [...projectShards, ...userShards]) {
         const db = await tursoConnectionManager.getConnection(shard.dbPath);
         const memories = await tursoVectorSearch.getAllMemories(db);
-        allMemories.push(
-          ...memories.filter(
+        await pushUnique(
+          memories.filter(
             (m: any) =>
               m.container_tag?.includes("_project_") || m.container_tag?.includes("_user_")
           )
@@ -213,9 +260,18 @@ export async function handleListMemories(
 
     let timeline: any[] = memoriesWithType;
     if (includePrompts) {
-      const projectPath = tag ? await getProjectPathFromTag(tag) : undefined;
-      const prompts = await userPromptManager.getCapturedPrompts(projectPath);
-      const promptsWithType = prompts.map((p) => ({
+      const promptById = new Map<string, any>();
+      if (filterTags.length === 0) {
+        const prompts = await userPromptManager.getCapturedPrompts(undefined);
+        for (const p of prompts) promptById.set(p.id, p);
+      } else {
+        for (const filterTag of filterTags) {
+          const projectPath = await getProjectPathFromTag(filterTag);
+          const prompts = await userPromptManager.getCapturedPrompts(projectPath);
+          for (const p of prompts) promptById.set(p.id, p);
+        }
+      }
+      const promptsWithType = [...promptById.values()].map((p) => ({
         type: "prompt",
         id: p.id,
         sessionId: p.sessionId,
@@ -249,21 +305,38 @@ export async function handleListMemories(
 
     const sortedTimeline: any[] = [];
     const pairValues = Array.from(linkedPairs.values());
-    const pairs = pairValues
-      .filter((p) => p.memory && p.prompt)
-      .sort((a, b) => b.memory.createdAt - a.memory.createdAt);
+    const completePairs = pairValues.filter((p) => p.memory && p.prompt);
     // A memory or prompt whose counterpart is missing (linked prompt deleted,
     // or prompt capture off) must still show up in the timeline, unlinked.
     for (const pair of pairValues) {
       if (pair.memory && !pair.prompt) standalone.push(pair.memory);
       else if (pair.prompt && !pair.memory) standalone.push(pair.prompt);
     }
-    for (const pair of pairs) {
-      sortedTimeline.push(pair.memory);
-      sortedTimeline.push(pair.prompt);
+
+    type TimelineGroup = { kind: "pair"; memory: any; prompt: any } | { kind: "item"; item: any };
+
+    const groups: TimelineGroup[] = [
+      ...completePairs.map((p) => ({ kind: "pair" as const, memory: p.memory, prompt: p.prompt })),
+      ...standalone.map((item) => ({ kind: "item" as const, item })),
+    ];
+
+    groups.sort((a, b) => {
+      const pinA = a.kind === "pair" ? Number(!!a.memory.isPinned) : Number(!!a.item.isPinned);
+      const pinB = b.kind === "pair" ? Number(!!b.memory.isPinned) : Number(!!b.item.isPinned);
+      if (pinA !== pinB) return pinB - pinA;
+      const timeA = a.kind === "pair" ? a.memory.createdAt : a.item.createdAt;
+      const timeB = b.kind === "pair" ? b.memory.createdAt : b.item.createdAt;
+      return timeB - timeA;
+    });
+
+    for (const group of groups) {
+      if (group.kind === "pair") {
+        sortedTimeline.push(group.memory);
+        sortedTimeline.push(group.prompt);
+      } else {
+        sortedTimeline.push(group.item);
+      }
     }
-    standalone.sort((a, b) => b.createdAt - a.createdAt);
-    sortedTimeline.push(...standalone);
     timeline = sortedTimeline;
 
     const total = timeline.length;
@@ -349,6 +422,22 @@ export async function handleAddMemory(data: {
       const id = `mem_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
       const now = Date.now();
 
+      const meta: Record<string, unknown> = { source: "api" };
+      if (isMarkdownBackend()) {
+        writeMemoryMarkdownFile({
+          id,
+          content: data.content,
+          type: data.type,
+          tags,
+          containerTag: data.containerTag,
+          createdAt: now,
+          updatedAt: now,
+          source: "api",
+          title: data.displayName,
+        });
+        meta.markdownRelPath = pluginMemoryRelPath(id);
+      }
+
       const record = {
         id,
         content: data.content,
@@ -365,7 +454,7 @@ export async function handleAddMemory(data: {
         projectPath: data.projectPath,
         projectName: data.projectName,
         gitRepoUrl: data.gitRepoUrl,
-        metadata: JSON.stringify({ source: "api" }),
+        metadata: JSON.stringify(meta),
       };
       const db = await tursoConnectionManager.getConnection(shard.dbPath);
       await tursoVectorSearch.insertVector(db, record);
@@ -389,8 +478,15 @@ export async function handleDeleteMemory(
       const db = await tursoConnectionManager.getConnection(shard.dbPath);
       const memory = await tursoVectorSearch.getMemoryById(db, id);
       if (memory) {
+        const metadata = safeJSONParse(memory.metadata);
+        if (isMarkdownBackend()) {
+          const rel =
+            metadata && typeof metadata.markdownRelPath === "string"
+              ? metadata.markdownRelPath
+              : null;
+          deleteMemoryMarkdownFile(id, rel);
+        }
         if (cascade) {
-          const metadata = safeJSONParse(memory.metadata);
           const linkedPromptId = metadata?.promptId;
           if (linkedPromptId) await userPromptManager.deletePrompt(linkedPromptId);
         }
@@ -398,9 +494,12 @@ export async function handleDeleteMemory(
         await tursoShardManager.decrementVectorCount(shard.id);
         return {
           success: true,
-          data: { deletedPrompt: cascade && !!safeJSONParse(memory.metadata)?.promptId },
+          data: { deletedPrompt: cascade && !!metadata?.promptId },
         };
       }
+    }
+    if (isMarkdownBackend()) {
+      deleteMemoryMarkdownFile(id);
     }
     return { success: false, error: "Memory not found" };
   } catch (error) {
@@ -464,6 +563,27 @@ export async function handleUpdateMemory(
     }
 
     const db = await tursoConnectionManager.getConnection(foundShard.dbPath);
+    const updatedAt = Date.now();
+    const memoryType = data.type || (existingMemory.type ? String(existingMemory.type) : undefined);
+    const containerTag = String(existingMemory.container_tag);
+    const existingMeta = safeJSONParse(existingMemory.metadata) || {};
+
+    if (isMarkdownBackend()) {
+      writeMemoryMarkdownFile({
+        id,
+        content: newContent,
+        type: memoryType,
+        tags,
+        containerTag,
+        createdAt: Number(existingMemory.created_at),
+        updatedAt,
+        source: typeof existingMeta.source === "string" ? existingMeta.source : "api",
+        title: existingMemory.display_name ? String(existingMemory.display_name) : undefined,
+      });
+      existingMeta.markdownRelPath = pluginMemoryRelPath(id);
+    }
+
+    const metadataJson = JSON.stringify(existingMeta);
 
     await db.transaction("write", async (tx) => {
       await tx.execute({ sql: `DELETE FROM memories WHERE id = ?`, args: [id] });
@@ -471,20 +591,25 @@ export async function handleUpdateMemory(
         sql: `
         INSERT INTO memories (
           id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
-          metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
-        ) VALUES (?, ?, vector32(?), ${tagsVector ? "vector32(?)" : "NULL"}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          metadata, session_id, display_name, user_name, user_email, project_path, project_name, git_repo_url
+        ) VALUES (?, ?, vector32(?), ${tagsVector ? "vector32(?)" : "NULL"}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
         args: [
           id,
           newContent,
           JSON.stringify(Array.from(vector)),
           ...(tagsVector ? [JSON.stringify(Array.from(tagsVector))] : []),
-          String(existingMemory.container_tag),
+          containerTag,
           tags.length > 0 ? tags.join(",") : null,
-          data.type || (existingMemory.type ? String(existingMemory.type) : null),
+          memoryType || null,
           Number(existingMemory.created_at),
-          Date.now(),
-          existingMemory.metadata ? String(existingMemory.metadata) : null,
+          updatedAt,
+          metadataJson,
+          existingMemory.session_id
+            ? String(existingMemory.session_id)
+            : parseSessionIdFromMetadata(
+                existingMemory.metadata ? String(existingMemory.metadata) : null
+              ),
           existingMemory.display_name ? String(existingMemory.display_name) : null,
           existingMemory.user_name ? String(existingMemory.user_name) : null,
           existingMemory.user_email ? String(existingMemory.user_email) : null,
@@ -498,6 +623,73 @@ export async function handleUpdateMemory(
     return { success: true };
   } catch (error) {
     log("handleUpdateMemory: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleGetMemory(id: string): Promise<ApiResponse<Memory>> {
+  try {
+    if (!id) return { success: false, error: "id is required" };
+    const shards = await getAllMemoryShards();
+    for (const shard of shards) {
+      const db = await tursoConnectionManager.getConnection(shard.dbPath);
+      const m = await tursoVectorSearch.getMemoryById(db, id);
+      if (m) {
+        return {
+          success: true,
+          data: {
+            id: String(m.id),
+            content: String(m.content),
+            type: m.type ? String(m.type) : undefined,
+            tags: m.tags
+              ? String(m.tags)
+                  .split(",")
+                  .map((t: string) => t.trim())
+                  .filter(Boolean)
+              : [],
+            createdAt: safeToISOString(m.created_at),
+            updatedAt: m.updated_at ? safeToISOString(m.updated_at) : undefined,
+            metadata: safeJSONParse(m.metadata),
+            displayName: m.display_name ? String(m.display_name) : undefined,
+            userName: m.user_name ? String(m.user_name) : undefined,
+            userEmail: m.user_email ? String(m.user_email) : undefined,
+            projectPath: m.project_path ? String(m.project_path) : undefined,
+            projectName: m.project_name ? String(m.project_name) : undefined,
+            gitRepoUrl: m.git_repo_url ? String(m.git_repo_url) : undefined,
+            isPinned: Number(m.is_pinned ?? 0) === 1,
+          },
+        };
+      }
+    }
+    return { success: false, error: "Memory not found" };
+  } catch (error) {
+    log("handleGetMemory: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleMarkdownStatus(): Promise<
+  ApiResponse<Awaited<ReturnType<typeof getMarkdownStatus>>>
+> {
+  try {
+    const data = await getMarkdownStatus();
+    return { success: true, data };
+  } catch (error) {
+    log("handleMarkdownStatus: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleMarkdownReindex(): Promise<ApiResponse<ReconcileResult>> {
+  try {
+    if (!isMarkdownBackend()) {
+      return { success: false, error: "markdown backend is not enabled" };
+    }
+    await ensureTursoReady();
+    const data = await reindexMarkdownVault();
+    return { success: true, data };
+  } catch (error) {
+    log("handleMarkdownReindex: error", { error: String(error) });
     return { success: false, error: String(error) };
   }
 }
@@ -539,7 +731,7 @@ type SearchResultItem = FormattedPrompt | FormattedMemory;
 
 export async function handleSearch(
   query: string,
-  tag?: string,
+  tag?: string | string[],
   page: number = 1,
   pageSize: number = 20
 ): Promise<ApiResponse<PaginatedResponse<SearchResultItem>>> {
@@ -550,24 +742,38 @@ export async function handleSearch(
     const queryVector = await embeddingService.embedWithTimeout(query, { task: "query" });
     const memoryResults: any[] = [];
     let promptResults: any[] = [];
-    if (tag) {
-      const { scope, hash } = extractScopeFromTag(tag);
-      const shards = await tursoShardManager.getAllShards(scope, hash);
-      for (const shard of shards) {
-        try {
-          const results = await tursoVectorSearch.searchInShard(
-            shard,
-            queryVector,
-            tag,
-            pageSize * 2
-          );
-          memoryResults.push(...results);
-        } catch (error) {
-          log("Shard search error", { shardId: shard.id, error: String(error) });
+    const filterTags = (Array.isArray(tag) ? tag : tag ? [tag] : [])
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (filterTags.length > 0) {
+      const seenMemoryKeys = new Set<string>();
+      const promptById = new Map<string, any>();
+      for (const filterTag of filterTags) {
+        const { scope, hash } = extractScopeFromTag(filterTag);
+        const shards = await tursoShardManager.getAllShards(scope, hash);
+        for (const shard of shards) {
+          try {
+            const results = await tursoVectorSearch.searchInShard(
+              shard,
+              queryVector,
+              filterTag,
+              pageSize * 2
+            );
+            for (const result of results) {
+              const key = String(result.id ?? `${result.memory}:${result.similarity}`);
+              if (seenMemoryKeys.has(key)) continue;
+              seenMemoryKeys.add(key);
+              memoryResults.push(result);
+            }
+          } catch (error) {
+            log("Shard search error", { shardId: shard.id, error: String(error) });
+          }
         }
+        const projectPath = await getProjectPathFromTag(filterTag);
+        const prompts = await userPromptManager.searchPrompts(query, projectPath, pageSize * 2);
+        for (const prompt of prompts) promptById.set(prompt.id, prompt);
       }
-      const projectPath = await getProjectPathFromTag(tag);
-      promptResults = await userPromptManager.searchPrompts(query, projectPath, pageSize * 2);
+      promptResults = [...promptById.values()];
     } else {
       const allShards = await getAllMemoryShards();
       const uniqueTags = new Set<string>();
@@ -716,37 +922,56 @@ export async function handleSearch(
   }
 }
 
-export async function handleStats(): Promise<
+export async function handleStats(
+  options: Pick<CollectDailyStatsOptions, "logDir" | "now"> & { probe?: boolean } = {}
+): Promise<
   ApiResponse<{
     total: number;
     byScope: { user: number; project: number };
     byType: Record<string, number>;
+    generatedAt: string;
+    shards: Awaited<ReturnType<typeof collectShardStats>>["shards"];
+    profile: Awaited<ReturnType<typeof collectProfileStats>>;
+    daily: ReturnType<typeof collectDailyStats>;
+    dailyError?: string;
   }>
 > {
   try {
+    // Ownership/liveness probes must stay cheap: auth already ran, do not open
+    // shards or scan logs under the 2s checkServerAvailable timeout.
+    if (options.probe) {
+      return { success: true };
+    }
+
     // Stats only counts Turso/libSQL rows; no embedding needed.
     // See handleListTags comment - keep embedding init out of read paths.
-    const shards = await getAllMemoryShards();
-    let userCount = 0,
-      projectCount = 0;
-    const typeCount: Record<string, number> = {};
-    for (const shard of shards) {
-      const db = await tursoConnectionManager.getConnection(shard.dbPath);
-      const memories = await tursoVectorSearch.getAllMemories(db);
-      for (const r of memories) {
-        const containerTag = String(r.container_tag ?? "");
-        const type = r.type ? String(r.type) : "";
-        if (containerTag.includes("_user_")) userCount++;
-        else if (containerTag.includes("_project_")) projectCount++;
-        if (type) typeCount[type] = (typeCount[type] || 0) + 1;
-      }
+    // Shard listing failures stay hard errors so /api/stats consumers (explorer
+    // header total) never treat an empty total as a successful empty store.
+    const memoryShards = await getAllMemoryShards();
+    const [shardStats, profile] = await Promise.all([
+      collectShardStats(memoryShards),
+      collectProfileStats(),
+    ]);
+
+    let daily: ReturnType<typeof collectDailyStats> = [];
+    let dailyError: string | undefined;
+    try {
+      daily = collectDailyStats(options);
+    } catch (error) {
+      dailyError = error instanceof Error ? error.message : String(error);
     }
+
     return {
       success: true,
       data: {
-        total: userCount + projectCount,
-        byScope: { user: userCount, project: projectCount },
-        byType: typeCount,
+        total: shardStats.total,
+        byScope: shardStats.byScope,
+        byType: shardStats.byType,
+        generatedAt: new Date().toISOString(),
+        shards: shardStats.shards,
+        profile,
+        daily,
+        ...(dailyError ? { dailyError } : {}),
       },
     };
   } catch (error) {
@@ -794,7 +1019,12 @@ export async function handleUnpinMemory(id: string): Promise<ApiResponse<void>> 
 }
 
 export async function handleRunCleanup(): Promise<
-  ApiResponse<{ deletedCount: number; userCount: number; projectCount: number }>
+  ApiResponse<{
+    deletedCount: number;
+    userCount: number;
+    projectCount: number;
+    aiSessionsDeleted?: number;
+  }>
 > {
   try {
     const { cleanupService } = await import("./cleanup-service.js");
@@ -932,7 +1162,7 @@ export async function handleGetUserProfile(userId?: string): Promise<ApiResponse
         createdAt: safeToISOString(profile.createdAt),
         lastAnalyzedAt: safeToISOString(profile.lastAnalyzedAt),
         totalPromptsAnalyzed: profile.totalPromptsAnalyzed,
-        profileData,
+        profileData: toPublicProfileData(profileData),
       },
     };
   } catch (error) {
@@ -970,7 +1200,7 @@ export async function handleGetProfileSnapshot(changelogId: string): Promise<Api
     const { userProfileManager } = await import("./user-profile/user-profile-manager.js");
     const changelog = await userProfileManager.getChangelogById(changelogId);
     if (!changelog) return { success: false, error: "Changelog not found" };
-    const profileData = JSON.parse(changelog.profileDataSnapshot);
+    const profileData = toPublicProfileData(JSON.parse(changelog.profileDataSnapshot));
     return {
       success: true,
       data: {
@@ -1091,8 +1321,10 @@ export async function handleAICleanup(
     return {
       success: true,
       data: {
-        old: profileData,
-        new: result.cleaned,
+        // Strip embeddings only on the HTTP response; pendingCleanups keeps
+        // full vectors for apply/merge.
+        old: toPublicProfileData(profileData),
+        new: toPublicProfileData(result.cleaned),
         changes: result.diff,
       },
     };
@@ -1427,6 +1659,8 @@ export async function handleDetectTagMigration(): Promise<
 
 interface MigrationProgress {
   processed: number;
+  /** Next index in the memory list to attempt; advances even when tagging fails. */
+  cursor: number;
   total: number;
   currentBatch: number;
   totalBatches: number;
@@ -1436,6 +1670,7 @@ interface MigrationProgress {
 
 const migrationProgress: MigrationProgress = {
   processed: 0,
+  cursor: 0,
   total: 0,
   currentBatch: 0,
   totalBatches: 0,
@@ -1447,18 +1682,182 @@ export async function handleGetTagMigrationProgress(): Promise<ApiResponse<Migra
   return { success: true, data: migrationProgress };
 }
 
+type TagMigrationChannel = "opencode" | "external";
+
+function isOpencodeTagMigrationConfigured(): boolean {
+  // "inherit" needs a live session model; tag migration has none.
+  return Boolean(
+    CONFIG.opencodeProvider && CONFIG.opencodeModel && CONFIG.opencodeModel !== "inherit"
+  );
+}
+
+function isExternalTagMigrationConfigured(): boolean {
+  return Boolean(CONFIG.memoryModel && CONFIG.memoryApiUrl);
+}
+
+function normalizeMigrationTags(tags: unknown): string[] {
+  if (!Array.isArray(tags)) return [];
+  return tags
+    .filter((t): t is string => typeof t === "string")
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function generateTagsViaOpencode(content: string): Promise<string[]> {
+  const { loadOpencodeProvider } = await import("./ai/opencode-provider-loader.js");
+  const { generateStructuredOutput } = await loadOpencodeProvider();
+  const { getOpenCodeClient } = await import("./ai/profile-llm-client.js");
+  const { z } = await import("zod");
+
+  const v2Client = await getOpenCodeClient();
+  const schema = z.object({
+    tags: z.array(z.string()).min(1).max(8),
+  });
+
+  const result = await generateStructuredOutput({
+    client: v2Client,
+    providerID: CONFIG.opencodeProvider!,
+    modelID: CONFIG.opencodeModel!,
+    ...(CONFIG.opencodeVariant ? { variant: CONFIG.opencodeVariant } : {}),
+    systemPrompt: "You are a technical tagger.",
+    userPrompt: `Generate 2-4 short technical tags for this memory content.\n\n${content}`,
+    schema,
+  });
+
+  return normalizeMigrationTags(result.tags);
+}
+
+async function generateTagsViaExternal(
+  content: string,
+  memoryId: string,
+  getProvider: () => Promise<{
+    executeToolCall: (
+      systemPrompt: string,
+      userPrompt: string,
+      toolSchema: unknown,
+      sessionId: string
+    ) => Promise<{ success: boolean; data?: { tags?: unknown }; error?: string }>;
+  }>
+): Promise<{ tags: string[] | null; error?: string }> {
+  const provider = await getProvider();
+  const prompt = `Generate 2-4 short technical tags for this memory content. Call the save_tags tool with a "tags" array.\n\n${content}`;
+  const result = await provider.executeToolCall(
+    "You are a technical tagger.",
+    prompt,
+    {
+      type: "function",
+      function: {
+        name: "save_tags",
+        description: "Save generated tags",
+        parameters: {
+          type: "object",
+          properties: { tags: { type: "array", items: { type: "string" } } },
+          required: ["tags"],
+        },
+      },
+    },
+    `migration_${memoryId}`
+  );
+
+  if (result.success && result.data?.tags) {
+    const tags = normalizeMigrationTags(result.data.tags);
+    if (tags.length > 0) return { tags };
+    return { tags: null, error: "no tags returned" };
+  }
+  return { tags: null, error: result.error ?? "no tags returned" };
+}
+
+async function generateMigrationTags(
+  content: string,
+  memoryId: string,
+  getExternalProvider: () => Promise<{
+    executeToolCall: (
+      systemPrompt: string,
+      userPrompt: string,
+      toolSchema: unknown,
+      sessionId: string
+    ) => Promise<{ success: boolean; data?: { tags?: unknown }; error?: string }>;
+  }>
+): Promise<{ tags: string[] | null; error?: string }> {
+  const order = CONFIG.autoCaptureProviderOrder ?? "opencode-first";
+  const channels: TagMigrationChannel[] =
+    order === "external-first" ? ["external", "opencode"] : ["opencode", "external"];
+
+  let lastError: string | undefined;
+
+  for (let i = 0; i < channels.length; i++) {
+    const channel = channels[i]!;
+    const configured =
+      channel === "opencode"
+        ? isOpencodeTagMigrationConfigured()
+        : isExternalTagMigrationConfigured();
+    if (!configured) continue;
+
+    try {
+      if (channel === "opencode") {
+        const tags = await generateTagsViaOpencode(content);
+        if (tags.length > 0) return { tags };
+        lastError = "no tags returned";
+      } else {
+        const result = await generateTagsViaExternal(content, memoryId, getExternalProvider);
+        if (result.tags) return result;
+        lastError = result.error ?? "no tags returned";
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      const nextConfigured = channels
+        .slice(i + 1)
+        .find((c) =>
+          c === "opencode" ? isOpencodeTagMigrationConfigured() : isExternalTagMigrationConfigured()
+        );
+      if (!nextConfigured) break;
+      log(`tag-migration: ${channel} provider failed, falling back`, {
+        memoryId,
+        error: lastError,
+        fallback: nextConfigured,
+      });
+    }
+  }
+
+  if (lastError) return { tags: null, error: lastError };
+  return {
+    tags: null,
+    error:
+      "No tag-migration provider configured. Set opencodeProvider/opencodeModel or memoryModel/memoryApiUrl/memoryApiKey.",
+  };
+}
+
 export async function handleRunTagMigrationBatch(
   batchSize: number = 5
-): Promise<ApiResponse<{ processed: number; total: number; hasMore: boolean }>> {
+): Promise<ApiResponse<{ processed: number; total: number; hasMore: boolean; errors: number }>> {
   try {
     await ensureTursoReady();
-    const { AIProviderFactory } = await import("./ai/ai-provider-factory.js");
-    const { buildMemoryProviderConfig } = await import("./ai/provider-config.js");
-    const providerConfig = buildMemoryProviderConfig(CONFIG, {
-      maxIterations: 1,
-      iterationTimeout: 30000,
-    });
-    const provider = AIProviderFactory.createProvider(CONFIG.memoryProvider, providerConfig);
+
+    if (!isOpencodeTagMigrationConfigured() && !isExternalTagMigrationConfigured()) {
+      return {
+        success: false,
+        error:
+          "No tag-migration provider configured. Set opencodeProvider/opencodeModel or memoryModel/memoryApiUrl/memoryApiKey.",
+      };
+    }
+
+    let externalProvider: Awaited<ReturnType<typeof createExternalTagProvider>> | null = null;
+    async function createExternalTagProvider() {
+      const { AIProviderFactory } = await import("./ai/ai-provider-factory.js");
+      const { buildMemoryProviderConfig } = await import("./ai/provider-config.js");
+      const providerConfig = buildMemoryProviderConfig(CONFIG, {
+        maxIterations: 1,
+        iterationTimeout: 30000,
+      });
+      return AIProviderFactory.createProvider(CONFIG.memoryProvider, providerConfig);
+    }
+    const getExternalProvider = async () => {
+      if (!externalProvider) {
+        externalProvider = await createExternalTagProvider();
+      }
+      return externalProvider;
+    };
+
     const projectShards = await tursoShardManager.getAllShards("project", "");
 
     const allMemories: { memory: any; shard: any }[] = [];
@@ -1471,13 +1870,19 @@ export async function handleRunTagMigrationBatch(
       }
     }
 
-    if (migrationProgress.total === 0) {
+    // Fresh run (or retry after a completed pass): reset counters so soft
+    // failures from a prior attempt can be retried instead of being skipped.
+    if (migrationProgress.total === 0 || migrationProgress.isComplete) {
+      migrationProgress.processed = 0;
+      migrationProgress.cursor = 0;
       migrationProgress.total = allMemories.length;
       migrationProgress.totalBatches = Math.ceil(allMemories.length / batchSize);
+      migrationProgress.currentBatch = 0;
       migrationProgress.isComplete = false;
+      migrationProgress.errors = [];
     }
 
-    const startIdx = migrationProgress.processed;
+    const startIdx = migrationProgress.cursor;
     const endIdx = Math.min(startIdx + batchSize, allMemories.length);
 
     for (let i = startIdx; i < endIdx; i++) {
@@ -1494,31 +1899,36 @@ export async function handleRunTagMigrationBatch(
               .filter((t: string) => t)
           : [];
 
+        // A memory that already has tags and a tags vector is fully migrated:
+        // re-embedding it produces the same vector and changes nothing. This
+        // endpoint walks the whole list one window at a time, and the normal
+        // case is a handful of untagged memories among hundreds that are done,
+        // so skipping the finished ones is the difference between a few
+        // seconds and re-vectorizing every memory on every run. Memories with
+        // tags but no tags vector are still processed so the missing vector is
+        // rebuilt.
+        if (currentTags.length > 0 && m.tags_vector != null) {
+          migrationProgress.processed++;
+          continue;
+        }
+
         if (currentTags.length === 0) {
-          const prompt = `Generate 2-4 short technical tags for this memory content:\n\n${m.content}\n\nReturn ONLY a comma-separated list of tags.`;
-          const result = await provider.executeToolCall(
-            "You are a technical tagger.",
-            prompt,
-            {
-              type: "function",
-              function: {
-                name: "save_tags",
-                description: "Save generated tags",
-                parameters: {
-                  type: "object",
-                  properties: { tags: { type: "array", items: { type: "string" } } },
-                  required: ["tags"],
-                },
-              },
-            },
-            `migration_${m.id}`
-          );
-          if (result.success && result.data?.tags) {
-            currentTags = result.data.tags;
+          const result = await generateMigrationTags(m.content, m.id, getExternalProvider);
+          if (result.tags && result.tags.length > 0) {
+            currentTags = result.tags;
             await db.run("UPDATE memories SET tags = ? WHERE id = ?", [
               currentTags.join(","),
               m.id,
             ]);
+          } else {
+            // Soft failure (e.g. empty tool-call args): do not mark processed.
+            // Cursor still advances below so the batch window moves forward.
+            const errorMsg = `Tag generation failed for memory ${m.id}: ${
+              result.error ?? "no tags returned"
+            }`;
+            migrationProgress.errors.push(errorMsg);
+            log("Migration error for memory", { id: m.id, error: errorMsg });
+            continue;
           }
         }
 
@@ -1538,8 +1948,9 @@ export async function handleRunTagMigrationBatch(
       }
     }
 
+    migrationProgress.cursor = endIdx;
     migrationProgress.currentBatch++;
-    const hasMore = migrationProgress.processed < migrationProgress.total;
+    const hasMore = migrationProgress.cursor < allMemories.length;
 
     if (!hasMore) {
       migrationProgress.isComplete = true;
@@ -1547,9 +1958,159 @@ export async function handleRunTagMigrationBatch(
 
     return {
       success: true,
-      data: { processed: migrationProgress.processed, total: migrationProgress.total, hasMore },
+      data: {
+        processed: migrationProgress.processed,
+        total: migrationProgress.total,
+        hasMore,
+        errors: migrationProgress.errors.length,
+      },
     };
   } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+function skillToApi(skill: {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  autoinvoke: boolean;
+  enabled: boolean;
+  containerTag: string | null;
+  createdAt: number;
+  updatedAt: number;
+}) {
+  return {
+    id: skill.id,
+    name: skill.name,
+    description: skill.description,
+    content: skill.content,
+    autoinvoke: skill.autoinvoke,
+    enabled: skill.enabled,
+    containerTag: skill.containerTag,
+    createdAt: safeToISOString(skill.createdAt),
+    updatedAt: safeToISOString(skill.updatedAt),
+  };
+}
+
+export async function handleListSkills(options?: {
+  containerTag?: string;
+  enabledOnly?: boolean;
+}): Promise<ApiResponse<{ items: ReturnType<typeof skillToApi>[] }>> {
+  try {
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const items = await skillsManager.list({
+      containerTag: options?.containerTag,
+      enabledOnly: options?.enabledOnly,
+    });
+    return { success: true, data: { items: items.map(skillToApi) } };
+  } catch (error) {
+    log("handleListSkills: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleGetSkill(
+  id: string
+): Promise<ApiResponse<ReturnType<typeof skillToApi>>> {
+  try {
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const skill = await skillsManager.get(id);
+    if (!skill) return { success: false, error: `Skill not found: ${id}` };
+    return { success: true, data: skillToApi(skill) };
+  } catch (error) {
+    log("handleGetSkill: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleCreateSkill(body: {
+  id?: string;
+  name?: string;
+  description?: string;
+  content?: string;
+  autoinvoke?: boolean;
+  enabled?: boolean;
+  containerTag?: string | null;
+}): Promise<ApiResponse<ReturnType<typeof skillToApi>>> {
+  try {
+    if (!body?.id || !body?.name || !body?.content) {
+      return { success: false, error: "id, name, and content are required" };
+    }
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const skill = await skillsManager.create({
+      id: body.id,
+      name: body.name,
+      description: body.description,
+      content: body.content,
+      autoinvoke: body.autoinvoke,
+      enabled: body.enabled,
+      containerTag: body.containerTag,
+    });
+    return { success: true, data: skillToApi(skill) };
+  } catch (error) {
+    log("handleCreateSkill: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleUpdateSkill(
+  id: string,
+  body: {
+    name?: string;
+    description?: string;
+    content?: string;
+    autoinvoke?: boolean;
+    enabled?: boolean;
+    containerTag?: string | null;
+  }
+): Promise<ApiResponse<ReturnType<typeof skillToApi>>> {
+  try {
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const skill = await skillsManager.update(id, body);
+    return { success: true, data: skillToApi(skill) };
+  } catch (error) {
+    log("handleUpdateSkill: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleDeleteSkill(id: string): Promise<ApiResponse<{ deleted: boolean }>> {
+  try {
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const deleted = await skillsManager.delete(id);
+    if (!deleted) return { success: false, error: `Skill not found: ${id}` };
+    return { success: true, data: { deleted: true } };
+  } catch (error) {
+    log("handleDeleteSkill: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleSkillsCatalogIndex(): Promise<
+  ApiResponse<{ skills: Array<{ name: string; version: string; files: string[] }> }>
+> {
+  try {
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const catalog = await skillsManager.toHttpCatalog();
+    return { success: true, data: catalog };
+  } catch (error) {
+    log("handleSkillsCatalogIndex: error", { error: String(error) });
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function handleSkillsCatalogFile(
+  id: string
+): Promise<ApiResponse<{ markdown: string }>> {
+  try {
+    const { skillsManager } = await import("./skills/skills-manager.js");
+    const markdown = await skillsManager.toCatalogMarkdown(id);
+    if (!markdown) return { success: false, error: `Skill not found: ${id}` };
+    return { success: true, data: { markdown } };
+  } catch (error) {
+    log("handleSkillsCatalogFile: error", { error: String(error) });
     return { success: false, error: String(error) };
   }
 }

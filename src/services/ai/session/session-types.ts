@@ -1,5 +1,14 @@
 export type AIProviderType =
-  "openai-chat" | "openai-responses" | "anthropic" | "minimax" | "google-gemini" | "orcarouter";
+  | "atlas-cloud"
+  | "api-route"
+  | "cheaper-inference"
+  | "openai-chat"
+  | "openai-responses"
+  | "anthropic"
+  | "minimax"
+  | "google-gemini"
+  | "orcarouter"
+  | "runcrate";
 
 export interface AIMessage {
   id?: number;

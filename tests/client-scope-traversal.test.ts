@@ -60,6 +60,7 @@ mock.module(${JSON.stringify(connectionManagerUrl)}, () => ({
 
 mock.module(${JSON.stringify(vectorUtilsUrl)}, () => ({
   formatTagsForEmbedding: (tags) => tags.join(" "),
+  parseSessionIdFromMetadata: () => null,
 }));
 
 mock.module(${JSON.stringify(readyUrl)}, () => ({
@@ -72,6 +73,8 @@ mock.module(${JSON.stringify(configUrl)}, () => ({
 
 mock.module(${JSON.stringify(loggerUrl)}, () => ({
   log: () => {},
+  safeLog: () => {},
+  serializeError: (error) => ({ error: error instanceof Error ? error.message : String(error) }),
 }));
 
 const { memoryClient } = await import(${JSON.stringify(clientUrl)});

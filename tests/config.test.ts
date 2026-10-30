@@ -31,12 +31,24 @@ describe("config", () => {
       expect(CONFIG.storagePath.length).toBeGreaterThan(0);
     });
 
+    it("should expose a valid memoryBackend", () => {
+      expect(["database", "markdown"]).toContain(CONFIG.memoryBackend);
+    });
+
     it("should default to Xenova/nomic-embed-text-v1 embedding model", () => {
       expect(typeof CONFIG.embeddingModel).toBe("string");
     });
 
     it("should default embeddingUseTaskPrefixes to false", () => {
       expect(CONFIG.embeddingUseTaskPrefixes).toBe(false);
+    });
+
+    it("should default embeddingPooling to mean", () => {
+      expect(CONFIG.embeddingPooling).toBe("mean");
+    });
+
+    it("should leave embeddingDtype unset by default", () => {
+      expect(CONFIG.embeddingDtype).toBeUndefined();
     });
 
     it("should have numeric embeddingDimensions", () => {
@@ -216,6 +228,10 @@ describe("config", () => {
 
     it("should expose the resolved auto-capture provider status on CONFIG", () => {
       expect(CONFIG.autoCaptureProviderStatus).toEqual(getAutoCaptureProviderStatus(CONFIG));
+    });
+
+    it("should default chatMessage.captureChildSessions to false", () => {
+      expect(CONFIG.chatMessage.captureChildSessions).toBe(false);
     });
   });
 

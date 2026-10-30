@@ -76,10 +76,51 @@ export function stripJsoncComments(content: string): string {
       continue;
     }
 
+    // Drop structural trailing commas (comma before } or ], allowing
+    // whitespace and comments in between).
+    if (char === "," && isTrailingComma(content, i)) {
+      i++;
+      continue;
+    }
+
     result += char;
     i++;
   }
 
-  // Remove trailing commas before } or ]
-  return result.replace(/,\s*([}\]])/g, "$1");
+  return result;
+}
+
+/** True when the comma at `commaIndex` is followed only by whitespace/comments then } or ]. */
+function isTrailingComma(content: string, commaIndex: number): boolean {
+  let next = commaIndex + 1;
+  while (next < content.length) {
+    const c = content.charAt(next);
+    const n = content.charAt(next + 1);
+
+    if (/\s/.test(c)) {
+      next++;
+      continue;
+    }
+
+    if (c === "/" && n === "/") {
+      next += 2;
+      while (next < content.length && content.charAt(next) !== "\n") next++;
+      continue;
+    }
+
+    if (c === "/" && n === "*") {
+      next += 2;
+      while (
+        next + 1 < content.length &&
+        !(content.charAt(next) === "*" && content.charAt(next + 1) === "/")
+      ) {
+        next++;
+      }
+      next += 2;
+      continue;
+    }
+
+    return c === "}" || c === "]";
+  }
+  return false;
 }
